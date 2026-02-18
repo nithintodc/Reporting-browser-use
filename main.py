@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from agents.browser_manager import BrowserManager
 from agents.gmail_agent import GmailAgent
 from agents.doordash_agent import DoorDashAgent
-from agents.report_storage_agent import ReportStorageAgent
+from agents.analysis_agent import run as analysis_run
 
 # Load environment variables from .env
 load_dotenv()
@@ -118,17 +118,39 @@ async def run_workflow() -> None:
                 get_otp_callback=get_otp,
                 download_dir=DOWNLOAD_DIR,
             )
+            report_start_date = "01/01/2026"
+            report_end_date = "01/31/2026"
             downloaded_path = await doordash_agent.run(
-                start_date="01/01/2026",
-                end_date="01/31/2026",
+                start_date=report_start_date,
+                end_date=report_end_date,
             )
 
             if not downloaded_path:
                 raise RuntimeError("DoorDash agent did not return a downloaded file path")
 
-            storage_agent = ReportStorageAgent(DOWNLOAD_DIR)
-            final_path = storage_agent.process(downloaded_path)
-            logger.info("Workflow completed. Report: %s", final_path)
+            # Save as-is (no rename). DoorDash may send .zip (with CSV inside) or .csv.
+            logger.info("Workflow completed. Downloaded file: %s", downloaded_path)
+
+            # Analysis step: unzip report, run analysis-app (FINANCIAL_DETAILED only), create final report
+            dl_path = Path(downloaded_path)
+            is_zip = dl_path.suffix.lower() == ".zip"
+            if not is_zip and dl_path.is_file() and dl_path.stat().st_size >= 4:
+                with open(dl_path, "rb") as f:
+                    is_zip = f.read(4) == b"PK\x03\x04"
+            if is_zip:
+                try:
+                    analysis_report_path = analysis_run(
+                        dl_path,
+                        output_dir=DOWNLOAD_DIR,
+                        report_start_date=report_start_date,
+                        report_end_date=report_end_date,
+                        operator_name=get_optional_env("OPERATOR_NAME"),
+                    )
+                    if analysis_report_path:
+                        logger.info("AnalysisAgent wrote final report: %s", analysis_report_path)
+                except Exception as analysis_err:
+                    logger.warning("AnalysisAgent failed (non-fatal): %s", analysis_err)
+
             await browser.close()
             return
 

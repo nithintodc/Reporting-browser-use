@@ -16,6 +16,8 @@ Multi-agent browser automation that logs into Gmail, extracts the DoorDash 2FA c
 .
 ├── main.py                 # Orchestrator (scripted): DoorDash login + report download
 ├── run_browser_use.py      # Optional: AI-driven flow via browser-use (LLM controls browser)
+├── run.sh                  # One-step run: venv + deps + main.py (macOS/Linux)
+├── run.bat                 # One-step run (Windows)
 ├── push_to_github.sh       # Script to push code to GitHub
 ├── requirements.txt
 ├── .env.example            # Copy to .env and fill credentials
@@ -59,6 +61,18 @@ Multi-agent browser automation that logs into Gmail, extracts the DoorDash 2FA c
    - `DOORDASH_PASSWORD` – DoorDash merchant portal password
 
 ## Run
+
+**Quick start (all-in-one):**
+
+```bash
+./run.sh              # Activate venv, install deps if needed, run main.py
+./run.sh browser-use   # Run AI-driven flow (run_browser_use.py)
+./run.sh install      # Only create venv + install deps; run later with ./run.sh
+```
+
+On Windows: `run.bat`, `run.bat browser-use`, `run.bat install`.
+
+---
 
 ### Option A: Real Chrome with a persistent profile (recommended)
 
@@ -119,12 +133,13 @@ Use full Chrome with a **dedicated profile** so cookies, login state, 2FA trust,
 For more flexible, LLM-driven control (e.g. if the portal UI changes or you want the agent to adapt):
 
 1. Install deps: `pip install -r requirements.txt` (includes `browser-use`).
-2. Set in `.env`: `OPENAI_API_KEY` or `BROWSER_USE_API_KEY`, plus `DOORDASH_EMAIL` and `DOORDASH_PASSWORD`. Optional: `CHROME_USER_DATA_DIR` for a persistent profile.
+2. Set in `.env`: **`OPENAI_API_KEY`** (recommended), plus `DOORDASH_EMAIL` and `DOORDASH_PASSWORD`. Optional: `CHROME_USER_DATA_DIR` for a persistent profile.
+   - If you see *"Failed to connect to browser-use API"* or *"nodename nor servname provided, or not known"*, use `OPENAI_API_KEY` instead of `BROWSER_USE_API_KEY` (OpenAI is reachable on most networks; Browser Use Cloud may be blocked).
 3. Close all Chrome windows, then run:
    ```bash
    python run_browser_use.py
    ```
-   The browser-use agent will open Chrome, log in, navigate to Reports, create the financial report for Jan 1–31 2026, and download it. Uses the same persistent profile as Option A when `CHROME_USER_DATA_DIR` is set.
+   The browser-use agent will open Chrome, log in, navigate to Reports, create the financial report for Jan 1–31 2026, and download it to `./downloads`. Extensions are disabled to avoid SSL errors on macOS.
 
 ## Behavior and robustness
 
