@@ -1,0 +1,11 @@
+# Browser automation
+playwright>=1.40.0
+
+# Optional: AI-driven browser control (run_browser_use.py)
+browser-use>=0.1.0
+
+# Environment & config
+python-dotenv>=1.0.0
+
+# Async (stdlib in 3.11+)
+# No extra deps for asyncio

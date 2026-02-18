@@ -1,0 +1,31 @@
+# Environment and secrets
+.env
+.env.local
+*.env
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Downloads (generated)
+downloads/
+
+# Cursor / debug
+.cursor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Playwright
+playwright-report/
+test-results/
+.playwright/
