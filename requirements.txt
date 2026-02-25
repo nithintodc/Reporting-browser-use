@@ -8,6 +8,10 @@ browser-use>=0.1.0
 pandas>=2.0.0
 openpyxl>=3.1.0
 
+# Google Sheets push (google_pusher_agent / analysis-app gdrive_utils)
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+
 # Environment & config
 python-dotenv>=1.0.0
 
