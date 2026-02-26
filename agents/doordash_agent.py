@@ -84,10 +84,10 @@ Important: The email field and password field appear on different steps. First s
 
 26. Edit Scheduling:
     - Click the EDIT (pencil) icon next to "Scheduling".
-    - Choose "Set a custom schedule".
-    - UNCHECK all days EXCEPT "Tuesday" (Mon, Wed, Thu, Fri, Sat, Sun must be unchecked; only Tuesday checked).
-    - Ensure Tuesday is checked for all timeslots.
-    - Click "Save".
+    - Choose "Set a custom schedule". A modal "Set custom schedule" will open with a grid of days and time slots.
+    - To clear all selections efficiently: click the "Weekdays" button at the top (this deselects Mon–Fri), then click the "Weekends" button (this deselects Sat–Sun). Do NOT click each day cell one by one.
+    - Then select only Tuesday: check all time slots for "Tue" (Early morning, Breakfast, Lunch, Afternoon, Dinner, Late night).
+    - Click "Save" at the bottom of the modal.
 
 27. Edit Campaign name:
     - Click the EDIT (pencil) icon next to "Campaign name".
@@ -98,6 +98,85 @@ Important: The email field and password field appear on different steps. First s
 
 === DONE ===
 When all steps are complete, use the done action to finish. Summarize what was done: login, both reports created, both reports downloaded, and campaign "{campaign_name}" created.
+"""
+
+
+def get_task_description_reports_only(
+    email: str,
+    password: str,
+    start_date: str,
+    end_date: str,
+) -> str:
+    """Task that ends after downloading both reports (no campaign). Used so we can run analysis before campaign."""
+    if not password:
+        raise ValueError("DOORDASH_PASSWORD is not set. Add it to your .env file (see .env.example).")
+    return f"""
+You are automating the DoorDash Merchant Portal. Complete the following steps in order. Stop after downloading both reports — do NOT create a campaign.
+
+=== STEP 0: Navigate and log in (DO THIS EXACT ORDER — two-step login) ===
+The login has TWO steps. Do NOT enter the password in the email field. Do NOT click "Log In" until the password screen is visible.
+
+1. Go to exactly this URL: https://merchant-portal.doordash.com/merchant/login
+2. On the first screen: find the EMAIL input field (labeled "Email"). Enter ONLY the email, exactly: {email}
+3. Click the "Continue to Log In" button (the red button). Wait for the page to change.
+4. On the NEXT screen: find the PASSWORD input field. Enter ONLY the password there: {password}
+5. Click the "Log In" button. Wait until the dashboard has loaded.
+
+=== STEP 1: Generate Financial Report ===
+6. In the LEFT SIDEBAR, click "Reports". Click "Create report". Select "Financial report" RADIO BUTTON, click "Next".
+7. Choose "By date range". Set Start date: {start_date}, End date: {end_date}. Click "Create report". Wait for the report to appear in the list.
+
+=== STEP 2: Generate Marketing Report ===
+8. Click "Create report". Select "Marketing report" RADIO BUTTON, click "Next". UNCHECK "Online Ordering", leave "Marketplace" CHECKED.
+9. By date range: Start {start_date}, End {end_date}. Click "Create report". Wait for it to appear.
+
+=== STEP 3: Download the Financial Report ===
+10. Find the recently created "Financials" (or "Financial") report. Click the DOWNLOAD icon next to it. Wait for the download to complete.
+
+=== STEP 4: Download the Marketing Report ===
+11. Find the recently created "Marketing" report. Click the DOWNLOAD icon next to it. Wait for the download to complete.
+
+=== DONE (stop here — no campaign) ===
+When both reports are downloaded, use the done action to finish. Summarize: login, both reports created and downloaded.
+"""
+
+
+def get_task_description_campaign_only(
+    email: str,
+    password: str,
+    store_search: str = "1864",
+    store_name: str = "McDonald's (1864 - PINE LAKE ROAD)",
+    campaign_name: str = "1864-Tue",
+) -> str:
+    """Task that does login then only campaign creation (reports already done)."""
+    if not password:
+        raise ValueError("DOORDASH_PASSWORD is not set. Add it to your .env file (see .env.example).")
+    return f"""
+You are automating the DoorDash Merchant Portal. You are already done with reports; now only create the marketing campaign. Complete the following in order.
+
+=== STEP 0: Log in (two-step login) ===
+1. Go to: https://merchant-portal.doordash.com/merchant/login
+2. Enter ONLY the email in the Email field: {email}. Click "Continue to Log In". Wait for the next screen.
+3. Enter ONLY the password in the Password field: {password}. Click "Log In". Wait for the dashboard.
+
+=== STEP 1: Create Marketing Campaign ===
+4. In the LEFT SIDEBAR, click "Marketing", then "Run a campaign". Click "Discount for all customers".
+
+5. Edit Stores: click EDIT (pencil) next to "Stores". In search type: {store_search}. Select "{store_name}". Click "Save".
+
+6. Edit Customer incentive: EDIT (pencil). Select "%", type 15. Minimum subtotal: "Custom", enter 10. Click "Save".
+
+7. Edit Scheduling: EDIT (pencil). Choose "Set a custom schedule". In the "Set custom schedule" modal:
+   - Click the "Weekdays" button at the top to deselect all weekday slots. Click the "Weekends" button to deselect all weekend slots. Do NOT click each day cell one by one.
+   - Then select only Tuesday (Tue): check all time slots for Tue (Early morning through Late night).
+   - Click "Save".
+
+8. Edit Campaign name: EDIT (pencil). Delete default and type exactly: {campaign_name}. Click "Save".
+
+9. Click the large "Create promotion" button at the bottom.
+
+=== DONE ===
+When the campaign is created, use the done action to finish. Summarize: login and campaign "{campaign_name}" created.
 """
 
 
@@ -171,6 +250,73 @@ def _discover_downloads(download_dir: Path) -> Tuple[Optional[Path], Optional[Pa
     return (marketing_path, financial_path)
 
 
+async def _run_agent(download_dir: Path, task: str) -> None:
+    """Run the browser-use agent with the given task (no download discovery)."""
+    from browser_use import Agent
+
+    download_dir = Path(download_dir)
+    download_dir.mkdir(parents=True, exist_ok=True)
+    llm = _get_llm()
+    browser = _get_browser(download_dir)
+    agent = Agent(task=task, llm=llm, browser=browser)
+    history = await agent.run()
+    if history and history.final_result:
+        logger.info("DoorDash (browser-use): %s", history.final_result)
+    else:
+        logger.info("DoorDash (browser-use): Run completed.")
+
+
+async def run_reports_only(
+    download_dir: Path,
+    email: str,
+    password: str,
+    start_date: str,
+    end_date: str,
+) -> Tuple[Optional[Path], Optional[Path]]:
+    """
+    Run only login + report creation + download. Stops before campaign.
+    Returns (marketing_download_path, financial_download_path) for analysis agents.
+    """
+    download_dir = Path(download_dir)
+    task = get_task_description_reports_only(
+        email=email,
+        password=password,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    logger.info("DoorDash (browser-use): Starting reports-only run (login, reports, download)")
+    await _run_agent(download_dir, task)
+    marketing_path, financial_path = _discover_downloads(download_dir)
+    if financial_path:
+        logger.info("DoorDash (browser-use): Financial report at %s", financial_path)
+    if marketing_path:
+        logger.info("DoorDash (browser-use): Marketing report at %s", marketing_path)
+    return (marketing_path, financial_path)
+
+
+async def run_campaign_only(
+    download_dir: Path,
+    email: str,
+    password: str,
+    store_search: str = "1864",
+    store_name: str = "McDonald's (1864 - PINE LAKE ROAD)",
+    campaign_name: str = "1864-Tue",
+) -> None:
+    """
+    Run only login + campaign creation. Use after reports are downloaded and analysis/combined report have run.
+    """
+    download_dir = Path(download_dir)
+    task = get_task_description_campaign_only(
+        email=email,
+        password=password,
+        store_search=store_search,
+        store_name=store_name,
+        campaign_name=campaign_name,
+    )
+    logger.info("DoorDash (browser-use): Starting campaign-only run")
+    await _run_agent(download_dir, task)
+
+
 async def run(
     download_dir: Path,
     email: str,
@@ -182,39 +328,13 @@ async def run(
     campaign_name: str = "1864-Tue",
 ) -> Tuple[Optional[Path], Optional[Path]]:
     """
-    Run the DoorDash Merchant Portal automation via browser-use.
-    Returns (marketing_download_path, financial_download_path) for use by analysis/marketing agents.
+    Run reports-only then return paths (convenience alias for run_reports_only).
+    For full flow with analysis in between, use run_reports_only → analysis → run_campaign_only from main.
     """
-    from browser_use import Agent
-
-    download_dir = Path(download_dir)
-    download_dir.mkdir(parents=True, exist_ok=True)
-
-    task = get_task_description(
+    return await run_reports_only(
+        download_dir=download_dir,
         email=email,
         password=password,
         start_date=start_date,
         end_date=end_date,
-        store_search=store_search,
-        store_name=store_name,
-        campaign_name=campaign_name,
     )
-
-    llm = _get_llm()
-    browser = _get_browser(download_dir)
-    agent = Agent(task=task, llm=llm, browser=browser)
-
-    logger.info("DoorDash (browser-use): Starting agent run")
-    history = await agent.run()
-    if history and history.final_result:
-        logger.info("DoorDash (browser-use): %s", history.final_result)
-    else:
-        logger.info("DoorDash (browser-use): Run completed.")
-
-    marketing_path, financial_path = _discover_downloads(download_dir)
-    if financial_path:
-        logger.info("DoorDash (browser-use): Financial report at %s", financial_path)
-    if marketing_path:
-        logger.info("DoorDash (browser-use): Marketing report at %s", marketing_path)
-
-    return (marketing_path, financial_path)

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from agents.doordash_agent import run as doordash_run
+from agents.doordash_agent import run_reports_only, run_campaign_only
 from agents.marketing_agent import run as marketing_run
 from agents.analysis_agent import run as analysis_run
 from agents.google_pusher_agent import run as google_pusher_run
@@ -89,7 +89,7 @@ def get_last_three_months_date_range():
 
 
 async def run_workflow() -> None:
-    """Run full workflow: DoorDash via browser-use (login, reports, download, campaign), then analysis and combined report."""
+    """Run: (1) Browser: login, reports, download → (2) Pause → (3) Financial + Marketing analysis → combined report → (4) Browser: campaign."""
     logger = logging.getLogger("main")
 
     doordash_email = get_required_env("DOORDASH_EMAIL")
@@ -109,8 +109,8 @@ async def run_workflow() -> None:
         try:
             logger.info("Attempt %d/%d", attempt, MAX_RETRIES)
 
-            # DoorDash: browser-use runs login, reports, download, campaign
-            marketing_path, financial_path = await doordash_run(
+            # Phase 1: Browser agent — login, create reports, download both (then stop)
+            marketing_path, financial_path = await run_reports_only(
                 download_dir=run_dir,
                 email=doordash_email,
                 password=doordash_password,
@@ -121,6 +121,8 @@ async def run_workflow() -> None:
             if not marketing_path and not financial_path:
                 raise RuntimeError("DoorDash (browser-use) did not return any downloaded file path")
 
+            # Phase 2: Pause browser agent; run Financial Analysis + Marketing Analysis → combined report
+            logger.info("Pausing browser agent; running Financial and Marketing analysis agents to create combined report.")
             # Run analyses in memory; build one combined workbook
             financial_sheets = None
             marketing_sheets = None
@@ -191,6 +193,17 @@ async def run_workflow() -> None:
                         logger.info("GooglePusherAgent: Pushed to %s", result.get("spreadsheet_url"))
                 except Exception as push_err:
                     logger.warning("GooglePusherAgent failed (non-fatal): %s", push_err)
+
+            # Phase 3: Browser agent again — login + create marketing campaign only
+            try:
+                await run_campaign_only(
+                    download_dir=run_dir,
+                    email=doordash_email,
+                    password=doordash_password,
+                )
+                logger.info("Campaign creation completed.")
+            except Exception as campaign_err:
+                logger.warning("Campaign run failed (non-fatal): %s", campaign_err)
 
             return
 
