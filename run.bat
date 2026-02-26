@@ -15,10 +15,9 @@ if not exist .venv (
 echo Activating venv...
 call .venv\Scripts\activate.bat
 
-python -c "import playwright" 2>nul || (
+python -c "import browser_use" 2>nul || (
   echo Installing dependencies...
   pip install -r requirements.txt
-  playwright install chromium
 )
 
 if not exist .env (

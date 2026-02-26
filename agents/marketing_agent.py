@@ -102,6 +102,17 @@ def _write_marketing_excel(
     filename = f"{tag}_marketing_analysis_{timestamp}.xlsx" if tag else f"marketing_analysis_{timestamp}.xlsx"
     filepath = output_dir / filename
 
+    def _normalize_store_column(df):
+        """Rename Store ID / Merchant store ID to Merchant Store ID for consistent output."""
+        if df is None or not hasattr(df, "columns"):
+            return df
+        out = df.copy()
+        for old in ("Store ID", "Merchant store ID"):
+            if old in out.columns and old != "Merchant Store ID":
+                out = out.rename(columns={old: "Merchant Store ID"})
+                break
+        return out
+
     def add_sheet(ws, df, title):
         if df is None or (hasattr(df, "empty") and df.empty):
             return
@@ -109,6 +120,7 @@ def _write_marketing_excel(
             df_export = df.reset_index()
         else:
             df_export = df
+        df_export = _normalize_store_column(df_export)
         for r_idx, row in enumerate(dataframe_to_rows(df_export, index=False, header=True), start=1):
             for c_idx, value in enumerate(row, start=1):
                 cell = ws.cell(row=r_idx, column=c_idx, value=value)
@@ -133,7 +145,7 @@ def _write_marketing_excel(
         add_sheet(ws, promotion_by_campaign, "Promotion by Campaign")
     if promotion_by_store is not None and not (getattr(promotion_by_store, "empty", True)):
         ws = wb.create_sheet("Promotion by Store")
-        ws.cell(row=1, column=1, value="Promotion: Store ID, Spend, Sales, Orders, ROAS, Cost per Order").font = Font(bold=True, size=12)
+        ws.cell(row=1, column=1, value="Promotion: Merchant Store ID, Spend, Sales, Orders, ROAS, Cost per Order").font = Font(bold=True, size=12)
         add_sheet(ws, promotion_by_store, "Promotion by Store")
     if sponsored_by_campaign is not None and not (getattr(sponsored_by_campaign, "empty", True)):
         ws = wb.create_sheet("Sponsored by Campaign Name")
@@ -141,11 +153,11 @@ def _write_marketing_excel(
         add_sheet(ws, sponsored_by_campaign, "Sponsored by Campaign")
     if sponsored_by_store is not None and not (getattr(sponsored_by_store, "empty", True)):
         ws = wb.create_sheet("Sponsored by Store")
-        ws.cell(row=1, column=1, value="Sponsored: Store ID, Spend, Sales, Orders, ROAS, Cost per Order").font = Font(bold=True, size=12)
+        ws.cell(row=1, column=1, value="Sponsored: Merchant Store ID, Spend, Sales, Orders, ROAS, Cost per Order").font = Font(bold=True, size=12)
         add_sheet(ws, sponsored_by_store, "Sponsored by Store")
     if store_wise_marketing is not None and not (getattr(store_wise_marketing, "empty", True)):
         ws = wb.create_sheet("Store-wise")
-        ws.cell(row=1, column=1, value="Store-wise (Combined): Store ID, Orders, Sales, Spend, ROAS, Cost per Order").font = Font(bold=True, size=12)
+        ws.cell(row=1, column=1, value="Store-wise (Combined): Merchant Store ID, Orders, Sales, Spend, ROAS, Cost per Order").font = Font(bold=True, size=12)
         add_sheet(ws, store_wise_marketing, "Store-wise")
     if not wb.sheetnames:
         ws = wb.create_sheet("Summary")

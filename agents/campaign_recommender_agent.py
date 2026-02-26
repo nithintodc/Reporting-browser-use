@@ -22,15 +22,18 @@ except ImportError:
     pd = None
 
 
+MERCHANT_STORE_ID_LABEL = "Merchant Store ID"
+
+
 def build_recommendations(store_aov: "pd.DataFrame") -> "pd.DataFrame":
     """
-    Build campaign recommendations table from a DataFrame with at least Store ID and AOV.
+    Build campaign recommendations table from a DataFrame with at least Merchant Store ID and AOV.
 
     Args:
-        store_aov: DataFrame with columns "Store ID" and "AOV" (numeric).
+        store_aov: DataFrame with columns "Merchant Store ID" or "Merchant store ID" and "AOV" (numeric).
 
     Returns:
-        DataFrame with Store ID, AOV, Min order (new cust) B, Discount % (new cust) A,
+        DataFrame with Merchant Store ID, AOV, Min order (new cust) B, Discount % (new cust) A,
         Recommendation 1, Min order (all cust) C, Recommendation 2.
     """
     if pd is None or store_aov is None or store_aov.empty:
@@ -38,9 +41,14 @@ def build_recommendations(store_aov: "pd.DataFrame") -> "pd.DataFrame":
     if "AOV" not in store_aov.columns:
         logger.warning("CampaignRecommenderAgent: No AOV column in store_aov")
         return pd.DataFrame()
-    store_col = "Store ID" if "Store ID" in store_aov.columns else store_aov.columns[0]
+    store_col = (
+        MERCHANT_STORE_ID_LABEL if MERCHANT_STORE_ID_LABEL in store_aov.columns
+        else "Merchant store ID" if "Merchant store ID" in store_aov.columns
+        else "Store ID" if "Store ID" in store_aov.columns
+        else store_aov.columns[0]
+    )
     out = store_aov[[store_col, "AOV"]].copy()
-    out = out.rename(columns={store_col: "Store ID"})
+    out = out.rename(columns={store_col: MERCHANT_STORE_ID_LABEL})
     aov = out["AOV"].astype(float)
     # B = MROUND(AOV, 5)
     B = (aov / 5).round() * 5
@@ -61,7 +69,7 @@ def build_recommendations(store_aov: "pd.DataFrame") -> "pd.DataFrame":
     )
     return out[
         [
-            "Store ID",
+            MERCHANT_STORE_ID_LABEL,
             "AOV",
             "Min order (new cust) B",
             "Discount % (new cust) A",
@@ -74,7 +82,7 @@ def build_recommendations(store_aov: "pd.DataFrame") -> "pd.DataFrame":
 
 def run(store_aov: Union["pd.DataFrame", Path]) -> Optional["pd.DataFrame"]:
     """
-    Build campaign recommendations. Accepts either a DataFrame with Store ID and AOV,
+    Build campaign recommendations. Accepts either a DataFrame with Merchant Store ID and AOV,
     or a path to a CSV with those columns.
 
     Returns:

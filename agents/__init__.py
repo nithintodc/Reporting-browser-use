@@ -1,13 +1,10 @@
-"""Multi-agent browser automation for DoorDash financial report download."""
+"""Multi-agent automation for DoorDash: browser-use (login, reports, download, campaign) + analysis agents."""
 
-from agents.browser_manager import BrowserManager
-from agents.gmail_agent import GmailAgent
-from agents.doordash_agent import DoorDashAgent
+from agents.doordash_agent import run as doordash_run, get_task_description
 from agents.report_storage_agent import ReportStorageAgent
 
 __all__ = [
-    "BrowserManager",
-    "GmailAgent",
-    "DoorDashAgent",
+    "doordash_run",
+    "get_task_description",
     "ReportStorageAgent",
 ]

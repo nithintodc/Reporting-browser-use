@@ -1,7 +1,4 @@
-# Browser automation
-playwright>=1.40.0
-
-# Optional: AI-driven browser control (run_browser_use.py)
+# Browser automation (LLM-driven)
 browser-use>=0.1.0
 
 # Data (AnalysisAgent / analysis-app)

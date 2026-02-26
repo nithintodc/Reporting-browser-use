@@ -574,7 +574,8 @@ def _dd_financial_with_dims(file_path, start_date, end_date, excluded_dates=None
         df = df.dropna(subset=['Slot'])
     else:
         df['Slot'] = 'All'
-    store_id_col = 'Store ID' if 'Store ID' in df.columns else None
+    # Financial raw data uses "Merchant store ID"; fallback to "Store ID"
+    store_id_col = 'Merchant store ID' if 'Merchant store ID' in df.columns else ('Store ID' if 'Store ID' in df.columns else None)
     if not store_col:
         df['Store name'] = 'All'
         df['Store'] = 'All'
@@ -690,7 +691,7 @@ def build_pivot_metrics_dd(dd_path, promo_df, sponsored_df, start_date, end_date
         if pd.notna(start_dt) and pd.notna(end_dt):
             promo_df = promo_df[(promo_df['Date'] >= start_dt) & (promo_df['Date'] <= end_dt)]
         promo_df['Day Type'] = promo_df['Date'].apply(get_day_type)
-        store_id_mkt = 'Store ID' if 'Store ID' in promo_df.columns else None
+        store_id_mkt = 'Merchant store ID' if 'Merchant store ID' in promo_df.columns else ('Store ID' if 'Store ID' in promo_df.columns else None)
         store_name_mkt = 'Store name' if 'Store name' in promo_df.columns else None
         for _, row in promo_df.iterrows():
             key = ()
@@ -730,7 +731,7 @@ def build_pivot_metrics_dd(dd_path, promo_df, sponsored_df, start_date, end_date
         if pd.notna(start_dt) and pd.notna(end_dt):
             sponsored_df = sponsored_df[(sponsored_df['Date'] >= start_dt) & (sponsored_df['Date'] <= end_dt)]
         sponsored_df['Day Type'] = sponsored_df['Date'].apply(get_day_type)
-        store_id_mkt = 'Store ID' if 'Store ID' in sponsored_df.columns else None
+        store_id_mkt = 'Merchant store ID' if 'Merchant store ID' in sponsored_df.columns else ('Store ID' if 'Store ID' in sponsored_df.columns else None)
         store_name_mkt = 'Store name' if 'Store name' in sponsored_df.columns else None
         for _, row in sponsored_df.iterrows():
             key = ()
@@ -830,7 +831,7 @@ def build_pivot_metrics_ue(ue_path, start_date, end_date, pivot_by, excluded_dat
         df = df.dropna(subset=['Slot'])
     else:
         df['Slot'] = 'All'
-    store_id_col = _find_ue_col(df, ['Store ID', 'External store ID'])
+    store_id_col = _find_ue_col(df, ['Merchant store ID', 'Store ID', 'External store ID'])
     if not store_col:
         df['Store'] = 'All'
     else:

@@ -20,11 +20,10 @@ echo "Activating venv..."
 # shellcheck source=/dev/null
 source .venv/bin/activate
 
-# 3. Install deps if needed (quick check: playwright not installed)
-if ! python -c "import playwright" 2>/dev/null; then
+# 3. Install deps if needed (quick check: browser_use not installed)
+if ! python -c "import browser_use" 2>/dev/null; then
   echo "Installing dependencies..."
   pip install -r requirements.txt
-  playwright install chromium
 fi
 
 # 4. Check .env exists

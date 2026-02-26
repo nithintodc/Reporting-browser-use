@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Orchestrator: starts browser, runs Gmail login, runs DoorDash workflow,
-closes browser gracefully. Uses structured logging and retries.
+Orchestrator: runs DoorDash workflow via browser-use (login, reports, download, campaign),
+then runs analysis agents and combined report. No Playwright; browser-use drives the browser.
 """
 
 import asyncio
@@ -13,14 +13,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from agents.browser_manager import BrowserManager
-from agents.gmail_agent import GmailAgent
-from agents.doordash_agent import DoorDashAgent
+from agents.doordash_agent import run as doordash_run
 from agents.marketing_agent import run as marketing_run
 from agents.analysis_agent import run as analysis_run
 from agents.google_pusher_agent import run as google_pusher_run
 from agents.combined_report_agent import run as combined_report_run
-from agents.marketing_campaign_agent import MarketingCampaignAgent
 
 # Load environment variables from .env
 load_dotenv()
@@ -92,84 +89,42 @@ def get_last_three_months_date_range():
 
 
 async def run_workflow() -> None:
-    """Run full workflow: Gmail login (or use existing session), DoorDash marketing report download (last 3 months), marketing analysis, save to downloads."""
+    """Run full workflow: DoorDash via browser-use (login, reports, download, campaign), then analysis and combined report."""
     logger = logging.getLogger("main")
-    use_local_browser = os.getenv("USE_LOCAL_BROWSER", "").strip().lower() in ("1", "true", "yes")
-    cdp_url = get_optional_env("LOCAL_BROWSER_CDP_URL", "http://localhost:9222")
 
-    if use_local_browser:
-        gmail_email = get_optional_env("GMAIL_EMAIL")
-        gmail_password = get_optional_env("GMAIL_PASSWORD")
-        doordash_email = get_required_env("DOORDASH_EMAIL")
-        doordash_password = get_required_env("DOORDASH_PASSWORD")
-        logger.info("Using local browser at %s (Gmail login skipped)", cdp_url)
-    else:
-        gmail_email = get_required_env("GMAIL_EMAIL")
-        gmail_password = get_required_env("GMAIL_PASSWORD")
-        doordash_email = get_required_env("DOORDASH_EMAIL")
-        doordash_password = get_required_env("DOORDASH_PASSWORD")
+    doordash_email = get_required_env("DOORDASH_EMAIL")
+    doordash_password = get_required_env("DOORDASH_PASSWORD")
+    get_required_env("BROWSER_USE_API_KEY")  # Native Browser Use API (required)
 
-    run_dir = _run_dir_for_email(gmail_email or doordash_email)
+    run_dir = _run_dir_for_email(doordash_email)
     run_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Run directory: %s", run_dir)
 
-    browser = BrowserManager(
-        headless=False,
-        download_dir=run_dir,
-        use_local_browser=use_local_browser,
-        cdp_url=cdp_url if use_local_browser else None,
-    )
+    report_start_date, report_end_date = get_last_three_months_date_range()
+    logger.info("Report date range (last 3 months): %s to %s", report_start_date, report_end_date)
+
     last_error: Exception | None = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             logger.info("Attempt %d/%d", attempt, MAX_RETRIES)
-            await browser.start()
 
-            if use_local_browser:
-                # Local browser: open only DoorDash (no Gmail tab). 2FA must be entered manually if prompted.
-                logger.info("Opening DoorDash merchant portal...")
-                doordash_page = await browser.new_tab()
-                async def get_otp_no_gmail():
-                    return None  # No Gmail agent; enter 2FA manually if required
-                get_otp = get_otp_no_gmail
-            else:
-                # Fresh browser: Gmail tab for OTP, then DoorDash
-                logger.info("Opening Gmail tab (for OTP when needed)...")
-                gmail_page = await browser.new_tab()
-                gmail_agent = GmailAgent(
-                    gmail_page,
-                    gmail_email,
-                    gmail_password,
-                    skip_login=False,
-                )
-                await gmail_agent.login()
-                logger.info("Opening DoorDash merchant portal...")
-                doordash_page = await browser.new_tab()
-                async def get_otp():
-                    return await gmail_agent.get_otp_from_latest_doordash_email()
-                get_otp = get_otp
-
-            doordash_agent = DoorDashAgent(
-                doordash_page,
-                doordash_email,
-                doordash_password,
-                get_otp_callback=get_otp,
+            # DoorDash: browser-use runs login, reports, download, campaign
+            marketing_path, financial_path = await doordash_run(
                 download_dir=run_dir,
-            )
-            report_start_date, report_end_date = get_last_three_months_date_range()
-            logger.info("Report date range (last 3 months): %s to %s", report_start_date, report_end_date)
-            marketing_path, financial_path = await doordash_agent.run(
+                email=doordash_email,
+                password=doordash_password,
                 start_date=report_start_date,
                 end_date=report_end_date,
             )
 
             if not marketing_path and not financial_path:
-                raise RuntimeError("DoorDash agent did not return any downloaded file path")
+                raise RuntimeError("DoorDash (browser-use) did not return any downloaded file path")
 
-            # Run analyses in memory (no separate financial/marketing files); build one combined workbook
+            # Run analyses in memory; build one combined workbook
             financial_sheets = None
             marketing_sheets = None
+
             if marketing_path:
                 logger.info("Marketing report: %s", marketing_path)
                 try:
@@ -237,34 +192,11 @@ async def run_workflow() -> None:
                 except Exception as push_err:
                     logger.warning("GooglePusherAgent failed (non-fatal): %s", push_err)
 
-            # Run marketing campaign setup (new users campaign: discount %, min subtotal, Breakfast + Monday, TODC-test)
-            try:
-                discount_pct = int(get_optional_env("CAMPAIGN_DISCOUNT_PCT") or "20")
-                min_subtotal = float(get_optional_env("CAMPAIGN_MIN_SUBTOTAL") or "20")
-                campaign_name = get_optional_env("CAMPAIGN_NAME") or "TODC-test"
-                campaign_agent = MarketingCampaignAgent(doordash_page)
-                ok = await campaign_agent.run(
-                    discount_pct=discount_pct,
-                    min_subtotal=min_subtotal,
-                    campaign_name=campaign_name,
-                )
-                if ok:
-                    logger.info("MarketingCampaignAgent: Campaign setup completed")
-                else:
-                    logger.warning("MarketingCampaignAgent: Campaign setup did not complete (check UI/selectors)")
-            except Exception as campaign_err:
-                logger.warning("MarketingCampaignAgent failed (non-fatal): %s", campaign_err)
-
-            await browser.close()
             return
 
         except Exception as e:
             last_error = e
             logger.warning("Attempt %d failed: %s", attempt, e, exc_info=True)
-            try:
-                await browser.close()
-            except Exception:
-                pass
             if attempt < MAX_RETRIES:
                 logger.info("Retrying in %s seconds...", RETRY_DELAY_SEC)
                 await asyncio.sleep(RETRY_DELAY_SEC)
@@ -279,8 +211,6 @@ async def run_workflow() -> None:
 def main() -> None:
     """Entry point: setup logging and run async workflow."""
     setup_logging()
-    if os.getenv("MARKETING_CAMPAIGN_DEBUG", "").strip().lower() in ("1", "true", "yes"):
-        logging.getLogger("agents.marketing_campaign_agent").setLevel(logging.DEBUG)
     asyncio.run(run_workflow())
 
 
