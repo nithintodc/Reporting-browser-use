@@ -4,10 +4,11 @@ Runs the full workflow: login, financial report, marketing report, download(s), 
 Returns paths to downloaded report file(s) for use by analysis_agent and marketing_agent.
 """
 
+import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Awaitable, Callable, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -17,9 +18,9 @@ def get_task_description(
     password: str,
     start_date: str,
     end_date: str,
-    store_search: str = "1864",
-    store_name: str = "McDonald's (1864 - PINE LAKE ROAD)",
-    campaign_name: str = "1864-Tue",
+    store_search: str,
+    store_name: str,
+    campaign_name: str,
 ) -> str:
     """Build the agent task with credentials and date range."""
     if not password:
@@ -87,14 +88,12 @@ Important: The email field and password field appear on different steps. First s
     - Choose "Set a custom schedule". A modal "Set custom schedule" will open with a grid of days and time slots.
     - To clear all selections efficiently: click the "Weekdays" button at the top (this deselects Mon–Fri), then click the "Weekends" button (this deselects Sat–Sun). Do NOT click each day cell one by one.
     - Then select only Tuesday: check all time slots for "Tue" (Early morning, Breakfast, Lunch, Afternoon, Dinner, Late night).
-    - Click "Save" at the bottom of the modal.
+    - Click "Save" at the bottom of the modal. Wait 2 seconds.
 
 27. Edit Campaign name:
-    - Click the EDIT (pencil) icon next to "Campaign name".
-    - Delete the default text and type exactly: {campaign_name}
-    - Click "Save".
+    - Click the EDIT (pencil) icon next to "Campaign name". Delete the default text and type exactly: {campaign_name}. Wait 2 seconds. Click "Save".
 
-28. Click the large "Create promotion" button at the bottom of the screen.
+28. Then click the large "Create promotion" button at the bottom of the screen.
 
 === DONE ===
 When all steps are complete, use the done action to finish. Summarize what was done: login, both reports created, both reports downloaded, and campaign "{campaign_name}" created.
@@ -144,9 +143,9 @@ When both reports are downloaded, use the done action to finish. Summarize: logi
 def get_task_description_campaign_only(
     email: str,
     password: str,
-    store_search: str = "1864",
-    store_name: str = "McDonald's (1864 - PINE LAKE ROAD)",
-    campaign_name: str = "1864-Tue",
+    store_search: str,
+    store_name: str,
+    campaign_name: str,
 ) -> str:
     """Task that does login then only campaign creation (reports already done)."""
     if not password:
@@ -169,14 +168,87 @@ You are automating the DoorDash Merchant Portal. You are already done with repor
 7. Edit Scheduling: EDIT (pencil). Choose "Set a custom schedule". In the "Set custom schedule" modal:
    - Click the "Weekdays" button at the top to deselect all weekday slots. Click the "Weekends" button to deselect all weekend slots. Do NOT click each day cell one by one.
    - Then select only Tuesday (Tue): check all time slots for Tue (Early morning through Late night).
-   - Click "Save".
+   - Click "Save". Wait 2 seconds.
 
-8. Edit Campaign name: EDIT (pencil). Delete default and type exactly: {campaign_name}. Click "Save".
+8. Edit Campaign name: click EDIT (pencil) next to "Campaign name". Delete the default text and type exactly: {campaign_name}. Wait 2 seconds. Click "Save".
 
-9. Click the large "Create promotion" button at the bottom.
+9. Then click the large "Create promotion" button at the bottom.
 
 === DONE ===
 When the campaign is created, use the done action to finish. Summarize: login and campaign "{campaign_name}" created.
+"""
+
+
+def get_task_description_campaign_already_logged_in(
+    store_search: str,
+    store_name: str,
+    campaign_name: str,
+) -> str:
+    """Task for campaign creation when already logged in (same browser session). No login steps."""
+    return f"""
+You are already logged in to the DoorDash Merchant Portal and viewing the dashboard. Do NOT go to the login page or enter credentials. Start from the current page.
+
+Create the marketing campaign:
+
+1. In the LEFT SIDEBAR, click "Marketing", then "Run a campaign". Click "Discount for all customers".
+
+2. Edit Stores: click EDIT (pencil) next to "Stores". In search type: {store_search}. Select "{store_name}". Click "Save".
+
+3. Edit Customer incentive: EDIT (pencil). Select "%", type 15. Minimum subtotal: "Custom", enter 10. Click "Save".
+
+4. Edit Scheduling: EDIT (pencil). Choose "Set a custom schedule". In the "Set custom schedule" modal:
+   - Click the "Weekdays" button at the top to deselect all weekday slots. Click the "Weekends" button to deselect all weekend slots. Do NOT click each day cell one by one.
+   - Then select only Tuesday (Tue): check all time slots for Tue (Early morning through Late night).
+   - Click "Save". Wait 2 seconds.
+
+5. Edit Campaign name: click EDIT (pencil) next to "Campaign name". Delete the default text and type exactly: {campaign_name}. Wait 2 seconds. Click "Save".
+
+6. Then click the large "Create promotion" button at the bottom.
+
+When the campaign is created, use the done action to finish. Summarize: campaign "{campaign_name}" created.
+"""
+
+
+def get_task_description_campaign_for_combo(combo: dict) -> str:
+    """
+    Build campaign task for one (store_id, day, slot, min_subtotal, campaign_name) from combined_analysis.
+    For use when already logged in (same browser session). Combo dict has keys:
+    store_id, day, slot, min_subtotal, campaign_name (e.g. TODC-{StoreID}-Monday-Breakfast).
+    """
+    store_id = str(combo.get("store_id", "")).strip()
+    day = str(combo.get("day", "")).strip()
+    slot = str(combo.get("slot", "")).strip()
+    min_subtotal = combo.get("min_subtotal", 10)
+    try:
+        min_subtotal = int(round(float(min_subtotal)))
+    except (TypeError, ValueError):
+        min_subtotal = 10
+    campaign_name = str(combo.get("campaign_name", f"TODC-{store_id}-{day}-{slot}")).strip()
+
+    # Day short form for UI (e.g. Monday -> Mon, Tuesday -> Tue)
+    day_short = day[:3] if len(day) >= 3 else day
+
+    return f"""
+You are already logged in to the DoorDash Merchant Portal. Do NOT go to login. Start from the current page.
+
+Create this campaign (exactly one store, one day, one slot):
+
+1. In the LEFT SIDEBAR, click "Marketing", then "Run a campaign". Click "Discount for all customers".
+
+2. Edit Stores: click EDIT (pencil) next to "Stores". In the search bar type: {store_id}. Select the store that contains "{store_id}" (e.g. McDonald's ({store_id} - ...)). Click "Save".
+
+3. Edit Customer incentive: click EDIT (pencil). Select the "%" (percentage) option. Type 15 in the percentage field. Under "Minimum subtotal", choose "Custom" and enter {min_subtotal} in the dollar amount field. For "Maximum discount amount", select the leftmost option ("Always lowest" or similar). Click "Save".
+
+4. Edit Scheduling: click EDIT (pencil). Choose "Set a custom schedule". In the modal:
+   - Click the "Weekdays" button to deselect all weekday slots. Click the "Weekends" button to deselect all weekend slots.
+   - Then select ONLY the single combination: Day = {day} ({day_short}) and Slot = {slot}. In the grid, check only the cell where column {day_short} meets row {slot}.
+   - Click "Save". Wait 2 seconds.
+
+5. Edit Campaign name: click EDIT (pencil) next to "Campaign name". Delete the default text and type exactly: {campaign_name}. Wait 2 seconds. Click "Save".
+
+6. Then click the large "Create promotion" button at the bottom.
+
+When the campaign is created, use the done action to finish. Summarize: campaign "{campaign_name}" created.
 """
 
 
@@ -195,14 +267,15 @@ def _get_llm():
     return ChatBrowserUse()
 
 
-def _get_browser(download_dir: Path):
-    """Browser with download path set to the given directory."""
+def _get_browser(download_dir: Path, keep_alive: bool = False):
+    """Browser with download path set to the given directory. keep_alive=True keeps browser open for reuse."""
     from browser_use import Browser
 
     downloads_path = str(download_dir.resolve())
     common = dict(
         downloads_path=downloads_path,
         enable_default_extensions=False,
+        keep_alive=keep_alive,
     )
     # Optional: use Chrome executable on macOS for consistent behavior
     if os.name == "posix":
@@ -298,9 +371,9 @@ async def run_campaign_only(
     download_dir: Path,
     email: str,
     password: str,
-    store_search: str = "1864",
-    store_name: str = "McDonald's (1864 - PINE LAKE ROAD)",
-    campaign_name: str = "1864-Tue",
+    store_search: str,
+    store_name: str,
+    campaign_name: str,
 ) -> None:
     """
     Run only login + campaign creation. Use after reports are downloaded and analysis/combined report have run.
@@ -317,15 +390,129 @@ async def run_campaign_only(
     await _run_agent(download_dir, task)
 
 
+async def run_reports_then_analysis_then_campaign(
+    download_dir: Path,
+    email: str,
+    password: str,
+    start_date: str,
+    end_date: str,
+    analysis_callback: Callable[[Optional[Path], Optional[Path]], Awaitable[Optional[Path]]],
+) -> None:
+    """
+    Single browser session: login → reports → download → (browser stays open) →
+    run analysis_callback(marketing_path, financial_path) → returns combined_path →
+    for each (store, day, slot) combo from combined_analysis Day-Slot sheets, run campaign (no login again) → close browser.
+
+    Store IDs come only from the logged-in account's combined_analysis sheets ("Day-Slot - {StoreID}"). No env store IDs.
+    """
+    from browser_use import Agent
+
+    try:
+        from agents.campaign_params import (
+            get_all_campaign_combos_from_combined_analysis,
+            ensure_campaigns_executed_csv,
+            log_campaign_executed,
+        )
+    except ImportError:
+        get_all_campaign_combos_from_combined_analysis = None
+        ensure_campaigns_executed_csv = None
+        log_campaign_executed = None
+
+    download_dir = Path(download_dir)
+    download_dir.mkdir(parents=True, exist_ok=True)
+
+    reports_task = get_task_description_reports_only(
+        email=email,
+        password=password,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    llm = _get_llm()
+    browser = _get_browser(download_dir, keep_alive=True)
+    agent = Agent(task=reports_task, llm=llm, browser=browser)
+
+    logger.info("DoorDash (browser-use): Phase 1 — reports (login, create, download); browser will stay open.")
+    await agent.run()
+
+    marketing_path, financial_path = _discover_downloads(download_dir)
+    if financial_path:
+        logger.info("DoorDash (browser-use): Financial report at %s", financial_path)
+    if marketing_path:
+        logger.info("DoorDash (browser-use): Marketing report at %s", marketing_path)
+
+    logger.info("DoorDash (browser-use): Pausing browser agent; running analysis callback.")
+    combined_path = await analysis_callback(marketing_path, financial_path)
+
+    if not combined_path or not Path(combined_path).is_file():
+        logger.warning(
+            "DoorDash (browser-use): No combined_analysis file returned. Set DOORDASH_* credentials and ensure financial/marketing analysis run; campaigns will use fallback env only if set."
+        )
+
+    combos = []
+    if combined_path and Path(combined_path).is_file() and get_all_campaign_combos_from_combined_analysis:
+        combos = get_all_campaign_combos_from_combined_analysis(Path(combined_path))
+        logger.info("DoorDash (browser-use): Found %s campaign combos from Day-Slot sheets (store IDs from sheets).", len(combos))
+
+    if hasattr(agent, "add_new_task"):
+        if combos:
+            if ensure_campaigns_executed_csv:
+                ensure_campaigns_executed_csv(download_dir)
+            logger.info("DoorDash (browser-use): Phase 2 — %s campaigns from combined_analysis (same session).", len(combos))
+            for i, combo in enumerate(combos, 1):
+                task = get_task_description_campaign_for_combo(combo)
+                agent.add_new_task(task)
+                try:
+                    await agent.run()
+                    status = "Completed"
+                except Exception as e:
+                    logger.warning("Campaign %s failed: %s", combo.get("campaign_name"), e)
+                    status = "Failed"
+                if log_campaign_executed:
+                    log_campaign_executed(
+                        download_dir,
+                        store_id=str(combo.get("store_id", "")),
+                        campaign_name=str(combo.get("campaign_name", "")),
+                        pct_value=15,
+                        min_subtotal=float(combo.get("min_subtotal", 10)),
+                        max_discount="Always lowest",
+                        status=status,
+                    )
+                logger.info("DoorDash (browser-use): Campaign %s/%s done: %s", i, len(combos), combo.get("campaign_name"))
+        else:
+            logger.warning(
+                "DoorDash (browser-use): No campaign combos from combined_analysis. Store IDs come only from that file (Day-Slot - {StoreID} sheets). Skip campaigns until combined_analysis is created for this account."
+            )
+    else:
+        logger.warning(
+            "Agent.add_new_task not found. Store IDs come only from combined_analysis; cannot run campaigns without chaining. Skip campaign phase."
+        )
+
+    try:
+        kill_fn = getattr(browser, "kill", None)
+        if callable(kill_fn):
+            result = kill_fn()
+            if asyncio.iscoroutine(result):
+                await result
+        else:
+            close_fn = getattr(browser, "close", None)
+            if callable(close_fn):
+                result = close_fn()
+                if asyncio.iscoroutine(result):
+                    await result
+    except Exception as e:
+        logger.debug("Browser close/kill: %s", e)
+
+
 async def run(
     download_dir: Path,
     email: str,
     password: str,
     start_date: str,
     end_date: str,
-    store_search: str = "1864",
-    store_name: str = "McDonald's (1864 - PINE LAKE ROAD)",
-    campaign_name: str = "1864-Tue",
+    store_search: str = "",
+    store_name: str = "",
+    campaign_name: str = "",
 ) -> Tuple[Optional[Path], Optional[Path]]:
     """
     Run reports-only then return paths (convenience alias for run_reports_only).
