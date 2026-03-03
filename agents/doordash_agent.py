@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, Tuple
 
+from agents.slack_agent import push_to_slack
+
 logger = logging.getLogger(__name__)
 
 
@@ -72,15 +74,18 @@ Important: The email field and password field appear on different steps. First s
 
 24. Edit Stores:
     - Find "Stores" and click the EDIT (pencil) icon next to it.
-    - In the search bar, type: {store_search}
-    - Select "{store_name}" from the results.
+    - Click "Select All" to clear all selected stores. Wait until all stores are unselected. NEVER search before clearing selections.
+    - THEN, in the search bar, type: {store_search}
+    - Select ONLY "{store_name}" from the results.
     - Click "Save".
 
 25. Edit Customer incentive:
     - Click the EDIT (pencil) icon next to "Customer incentive".
     - Select the "%" (percentage) option.
-    - Type 15 in the percentage field.
+    - Click the 15% radio button
     - Under "Minimum subtotal", choose "Custom" and enter 10 in the dollar amount field.
+    - Wait 5 seconds for the maximum discount amounts to update.
+    - Under "Maximum discount amount": There is a row of button options. YOU MUST click the LEFTMOST button in the row, which will ALWAYS be the lowest dollar value. NEVER select the middle or right buttons. DO NOT evaluate the text or look for specific dollar amounts, just click the leftmost button.
     - Click "Save".
 
 26. Edit Scheduling:
@@ -91,9 +96,13 @@ Important: The email field and password field appear on different steps. First s
     - Click "Save" at the bottom of the modal. Wait 2 seconds.
 
 27. Edit Campaign name:
-    - Click the EDIT (pencil) icon next to "Campaign name". Delete the default text and type exactly: {campaign_name}. Wait 2 seconds. Click "Save".
+    - Click the EDIT (pencil) icon next to "Campaign name".
+    - Delete the default text and type exactly: {campaign_name}.
+    - Wait until the new name is fully typed.
+    - Click "Save" inside the Campaign name module.
+    - Wait for confirmation that the name is saved.
 
-28. Then click the large "Create promotion" button at the bottom of the screen.
+28. ONLY AFTER successful save -> Click the large "Create promotion" button at the bottom of the screen. NEVER click "Create promotion" before campaign name is saved.
 
 === DONE ===
 When all steps are complete, use the done action to finish. Summarize what was done: login, both reports created, both reports downloaded, and campaign "{campaign_name}" created.
@@ -161,18 +170,18 @@ You are automating the DoorDash Merchant Portal. You are already done with repor
 === STEP 1: Create Marketing Campaign ===
 4. In the LEFT SIDEBAR, click "Marketing", then "Run a campaign". Click "Discount for all customers".
 
-5. Edit Stores: click EDIT (pencil) next to "Stores". In search type: {store_search}. Select "{store_name}". Click "Save".
+5. Edit Stores: click EDIT (pencil) next to "Stores". Click "Select All" to clear all selected stores. Wait until all stores are unselected. NEVER search before clearing selections. Use the search bar to type: {store_search}. Select ONLY "{store_name}". Click "Save".
 
-6. Edit Customer incentive: EDIT (pencil). Select "%", type 15. Minimum subtotal: "Custom", enter 10. Click "Save".
+6. Edit Customer incentive: EDIT (pencil). Select the "%" (percentage) option. Click the 15% radio button. Minimum subtotal: "Custom", enter 10. Wait 5 seconds. Maximum discount amount: There is a row of button options natively selected. YOU MUST click the LEFTMOST button in the row, which will ALWAYS be the lowest dollar value. NEVER select the middle or right buttons. DO NOT evaluate the text or look for specific dollar amounts, just click the leftmost button. Click "Save".
 
 7. Edit Scheduling: EDIT (pencil). Choose "Set a custom schedule". In the "Set custom schedule" modal:
    - Click the "Weekdays" button at the top to deselect all weekday slots. Click the "Weekends" button to deselect all weekend slots. Do NOT click each day cell one by one.
    - Then select only Tuesday (Tue): check all time slots for Tue (Early morning through Late night).
    - Click "Save". Wait 2 seconds.
 
-8. Edit Campaign name: click EDIT (pencil) next to "Campaign name". Delete the default text and type exactly: {campaign_name}. Wait 2 seconds. Click "Save".
+8. Edit Campaign name: click EDIT (pencil) next to "Campaign name". Delete the default text and type exactly: {campaign_name}. Wait until the new name is fully typed. Click "Save" inside the module. Wait for confirmation that the name is saved.
 
-9. Then click the large "Create promotion" button at the bottom.
+9. ONLY AFTER successful save -> click the large "Create promotion" button at the bottom. NEVER click before campaign name is saved.
 
 === DONE ===
 When the campaign is created, use the done action to finish. Summarize: login and campaign "{campaign_name}" created.
@@ -192,18 +201,18 @@ Create the marketing campaign:
 
 1. In the LEFT SIDEBAR, click "Marketing", then "Run a campaign". Click "Discount for all customers".
 
-2. Edit Stores: click EDIT (pencil) next to "Stores". In search type: {store_search}. Select "{store_name}". Click "Save".
+2. Edit Stores: click EDIT (pencil) next to "Stores". Click "Select All" to clear all selected stores. Wait until all stores are unselected. NEVER search before clearing selections. Use the search bar to type: {store_search}. Select ONLY "{store_name}". Click "Save".
 
-3. Edit Customer incentive: EDIT (pencil). Select "%", type 15. Minimum subtotal: "Custom", enter 10. Click "Save".
+3. Edit Customer incentive: EDIT (pencil). Select the "%" (percentage) option. Click the 15% radio button. Minimum subtotal: "Custom", enter 10. Wait 5 seconds. Maximum discount amount: There is a row of button options natively selected. YOU MUST click the LEFTMOST button in the row, which will ALWAYS be the lowest dollar value. NEVER select the middle or right buttons. DO NOT evaluate the text or look for specific dollar amounts, just click the leftmost button. Click "Save".
 
 4. Edit Scheduling: EDIT (pencil). Choose "Set a custom schedule". In the "Set custom schedule" modal:
    - Click the "Weekdays" button at the top to deselect all weekday slots. Click the "Weekends" button to deselect all weekend slots. Do NOT click each day cell one by one.
    - Then select only Tuesday (Tue): check all time slots for Tue (Early morning through Late night).
    - Click "Save". Wait 2 seconds.
 
-5. Edit Campaign name: click EDIT (pencil) next to "Campaign name". Delete the default text and type exactly: {campaign_name}. Wait 2 seconds. Click "Save".
+5. Edit Campaign name: click EDIT (pencil) next to "Campaign name". Delete the default text and type exactly: {campaign_name}. Wait until the new name is fully typed. Click "Save" inside the module. Wait for confirmation that the name is saved.
 
-6. Then click the large "Create promotion" button at the bottom.
+6. ONLY AFTER successful save -> click the large "Create promotion" button at the bottom. NEVER click before campaign name is saved.
 
 When the campaign is created, use the done action to finish. Summarize: campaign "{campaign_name}" created.
 """
@@ -235,18 +244,18 @@ Create this campaign (exactly one store, one day, one slot):
 
 1. In the LEFT SIDEBAR, click "Marketing", then "Run a campaign". Click "Discount for all customers".
 
-2. Edit Stores: click EDIT (pencil) next to "Stores". In the search bar type: {store_id}. Select the store that contains "{store_id}" (e.g. McDonald's ({store_id} - ...)). Click "Save".
+2. Edit Stores: click EDIT (pencil) next to "Stores". Click "Select All" to clear all selected stores. Wait until all stores are unselected. NEVER search before clearing selections. In the search bar type: {store_id}. Select ONLY the store that contains "{store_id}" (e.g. McDonald's ({store_id} - ...)). Click "Save".
 
-3. Edit Customer incentive: click EDIT (pencil). Select the "%" (percentage) option. Type 15 in the percentage field. Under "Minimum subtotal", choose "Custom" and enter {min_subtotal} in the dollar amount field. For "Maximum discount amount", select the leftmost option ("Always lowest" or similar). Click "Save".
+3. Edit Customer incentive: click EDIT (pencil). Select the "%" (percentage) option. Click the 15% radio button. Under "Minimum subtotal", choose "Custom" and enter {min_subtotal} in the dollar amount field. Wait 5 seconds. For "Maximum discount amount": There is a row of button options natively selected. YOU MUST click the LEFTMOST button in the row, which will ALWAYS be the lowest dollar value. NEVER select the middle or right buttons. DO NOT evaluate the text or look for specific dollar amounts, just click the leftmost button. Click "Save".
 
 4. Edit Scheduling: click EDIT (pencil). Choose "Set a custom schedule". In the modal:
    - Click the "Weekdays" button to deselect all weekday slots. Click the "Weekends" button to deselect all weekend slots.
    - Then select ONLY the single combination: Day = {day} ({day_short}) and Slot = {slot}. In the grid, check only the cell where column {day_short} meets row {slot}.
    - Click "Save". Wait 2 seconds.
 
-5. Edit Campaign name: click EDIT (pencil) next to "Campaign name". Delete the default text and type exactly: {campaign_name}. Wait 2 seconds. Click "Save".
+5. Edit Campaign name: click EDIT (pencil) next to "Campaign name". Delete the default text and type exactly: {campaign_name}. Wait until the new name is fully typed. Click "Save" inside the module. Wait for confirmation that the name is saved.
 
-6. Then click the large "Create promotion" button at the bottom.
+6. ONLY AFTER successful save -> click the large "Create promotion" button at the bottom. NEVER click before campaign name is saved.
 
 When the campaign is created, use the done action to finish. Summarize: campaign "{campaign_name}" created.
 """
@@ -433,13 +442,28 @@ async def run_reports_then_analysis_then_campaign(
     agent = Agent(task=reports_task, llm=llm, browser=browser)
 
     logger.info("DoorDash (browser-use): Phase 1 — reports (login, create, download); browser will stay open.")
-    await agent.run()
+    try:
+        await agent.run()
+        push_to_slack(f"1) Login successful for {email}")
+    except Exception as e:
+        push_to_slack(f"1) Login failed for {email}: {e}")
+        raise e
 
     marketing_path, financial_path = _discover_downloads(download_dir)
     if financial_path:
         logger.info("DoorDash (browser-use): Financial report at %s", financial_path)
+        push_to_slack("2) Financials Report pulled")
+    else:
+        push_to_slack("2) Financials Report failed: file not found")
+        
     if marketing_path:
         logger.info("DoorDash (browser-use): Marketing report at %s", marketing_path)
+        push_to_slack("3) Marketing report pulled")
+    else:
+        push_to_slack("3) Marketing report failed: file not found")
+
+    if financial_path and marketing_path:
+        push_to_slack("4) Reports downloaded")
 
     logger.info("DoorDash (browser-use): Pausing browser agent; running analysis callback.")
     combined_path = await analysis_callback(marketing_path, financial_path)
@@ -448,6 +472,8 @@ async def run_reports_then_analysis_then_campaign(
         logger.warning(
             "DoorDash (browser-use): No combined_analysis file returned. Set DOORDASH_* credentials and ensure financial/marketing analysis run; campaigns will use fallback env only if set."
         )
+    else:
+        push_to_slack("5) Combined analysis formed")
 
     combos = []
     if combined_path and Path(combined_path).is_file() and get_all_campaign_combos_from_combined_analysis:
@@ -462,12 +488,23 @@ async def run_reports_then_analysis_then_campaign(
             for i, combo in enumerate(combos, 1):
                 task = get_task_description_campaign_for_combo(combo)
                 agent.add_new_task(task)
+                
+                campaign_name = str(combo.get("campaign_name", ""))
+                store_id = str(combo.get("store_id", ""))
+                day = str(combo.get("day", ""))
+                slot = str(combo.get("slot", ""))
+                min_subtotal = str(combo.get("min_subtotal", "10"))
+                
+                push_to_slack(f"6) {campaign_name} setup in progress with variables - {store_id}, {day}, {slot}, {min_subtotal}")
+                
                 try:
                     await agent.run()
                     status = "Completed"
+                    push_to_slack(f"7) {campaign_name} setup done")
                 except Exception as e:
                     logger.warning("Campaign %s failed: %s", combo.get("campaign_name"), e)
                     status = "Failed"
+                    push_to_slack(f"7) {campaign_name} setup failed: {e}")
                 if log_campaign_executed:
                     log_campaign_executed(
                         download_dir,

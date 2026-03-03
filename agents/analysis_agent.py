@@ -198,9 +198,9 @@ def _build_day_slot(df: pd.DataFrame, date_col: str, time_col: str, subtotal_col
     agg = agg.sort_values(["Day", "Slot"]).drop(columns=["_day", "_slot"]).reset_index(drop=True)
     # After AOV: uplift = AOV*1.2, Min.Subtotal = CEILING(uplift, 5), campaign recommendation
     agg["uplift"] = (agg["AOV"] * 1.2).round(2)
-    agg["Min.Subtotal"] = agg["uplift"].astype(float).apply(lambda x: int(math.ceil(x / 5) * 5))
+    agg["Min.Subtotal"] = agg["uplift"].astype(float).apply(lambda x: int(math.ceil(x / 5) * 5) if pd.notna(x) else 0)
     agg["campaign recommendation"] = agg["Min.Subtotal"].apply(
-        lambda m: f"All customers 15% off on min order of {m} upto Always lowest"
+        lambda m: f"All customers 15% off on min order of {m} upto Always lowest" if m > 0 else "No recommendation (no data)"
     )
     return agg[["Day", "Slot", "Sales", "Payouts", "Profitability", "Orders", "AOV", "uplift", "Min.Subtotal", "campaign recommendation"]]
 
@@ -292,14 +292,15 @@ def _build_campaign_recommendations(store_metrics: pd.DataFrame) -> pd.DataFrame
     if store_metrics.empty or "AOV" not in store_metrics.columns:
         return pd.DataFrame()
     out = store_metrics[[MERCHANT_STORE_ID_LABEL, "AOV"]].copy()
-    aov = out["AOV"].astype(float)
+    aov = out["AOV"].astype(float).fillna(0)
     # B = MROUND(AOV, 5)
     B = (aov / 5).round() * 5
     B = B.clip(lower=5)  # at least 5
     # A = 20 if B > AOV else 15
     A = (20 * (B > aov) + 15 * (B <= aov)).astype(int)
+    A = A.replace(0, 15)  # Fallback if both false due to nan, though fillna(0) fixes it
     # C = CEILING(AOV*1.2, 5)
-    C = aov.apply(lambda x: math.ceil((float(x) * 1.2) / 5) * 5)
+    C = aov.apply(lambda x: math.ceil((float(x) * 1.2) / 5) * 5 if pd.notna(x) else 5)
     C = C.clip(lower=5)
     out["Min order (new cust) B"] = B
     out["Discount % (new cust) A"] = A
