@@ -1,11 +1,10 @@
 # Browser automation (LLM-driven)
 browser-use>=0.1.0
 
-# Data (AnalysisAgent / analysis-app)
 pandas>=2.0.0
 openpyxl>=3.1.0
 
-# Google Sheets push (google_pusher_agent / analysis-app gdrive_utils)
+# Google Sheets push (google_pusher_agent)
 google-api-python-client>=2.100.0
 google-auth>=2.23.0
 

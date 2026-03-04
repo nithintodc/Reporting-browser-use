@@ -2,8 +2,17 @@
 .env
 .env.local
 .env.*
-!.env.example
 *.env
+
+# General Keys and Secrets (never commit)
+*.pem
+*.key
+*.cert
+*.p12
+*.pfx
+*secret*
+*.rsa
+*.pub
 
 # Google Cloud / GCP credentials (never commit)
 todc-marketing-*.json

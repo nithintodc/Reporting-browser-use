@@ -18,7 +18,6 @@ try:
 except ImportError:
     pd = None
 
-# Slot boundaries from analysis-app slot_analysis (minutes since midnight)
 SLOT_ORDER = ["Early morning", "Breakfast", "Lunch", "Afternoon", "Dinner", "Late night"]
 
 
@@ -43,7 +42,6 @@ def _extract_financial_detailed_csv(zip_path: Path, output_dir: Path) -> Optiona
 
 
 def _get_time_slot(time_str) -> Optional[str]:
-    """Same logic as analysis-app slot_analysis.get_time_slot."""
     if pd.isna(time_str) or time_str == "":
         return None
     try:
@@ -69,7 +67,6 @@ def _get_time_slot(time_str) -> Optional[str]:
 
 
 def _resolve_columns(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """Return (date_col, time_col, subtotal_col, payout_col, order_col). Names from analysis-app."""
     df.columns = df.columns.str.strip()
     date_col = None
     for c in ["Timestamp local date", "Timestamp Local Date", "Date", "date"]:

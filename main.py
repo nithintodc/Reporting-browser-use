@@ -18,6 +18,7 @@ from agents.marketing_agent import run as marketing_run
 from agents.analysis_agent import run as analysis_run
 from agents.google_pusher_agent import run as google_pusher_run
 from agents.combined_report_agent import run as combined_report_run
+from agents.slack_log_notifier import install_slack_log_notifier
 
 # Load environment variables from .env
 load_dotenv()
@@ -227,6 +228,7 @@ async def run_workflow() -> None:
 def main() -> None:
     """Entry point: setup logging and run async workflow."""
     setup_logging()
+    install_slack_log_notifier()  # send Slack when terminal/log signals appear (e.g. "Login was successful")
     asyncio.run(run_workflow())
 
 

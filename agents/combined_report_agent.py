@@ -6,9 +6,13 @@ Can write from in-memory sheet data (DataFrames) or from existing xlsx files.
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
+
+# Sheet name and headers for campaign mappings (store → min_subtotal → slot tags)
+CAMPAIGN_MAPPINGS_SHEET = "Campaign Mappings"
+CAMPAIGN_MAPPINGS_HEADERS = ("Store ID", "Minimum Subtotal", "Slot Tags", "Campaign Name")
 
 try:
     import pandas as pd
@@ -165,6 +169,77 @@ def write_combined_from_sheets(
     wb.save(out_path)
     logger.info("CombinedReportAgent: Wrote %s (%s sheets)", out_path.name, sheet_count)
     return out_path
+
+
+def append_campaign_mappings_to_workbook(
+    combined_xlsx_path: Path,
+    mappings: List[Dict[str, Any]],
+) -> None:
+    """
+    Append a "Campaign Mappings" sheet to an existing combined_analysis workbook.
+
+    Each item in mappings should have:
+        store_id: str
+        min_subtotal: int | float
+        slot_tags: list of int/str (UI slot identifiers)
+        campaign_name: str (e.g. TODC-{StoreID}-${min_subtotal})
+
+    Slot tags are written as a comma-separated string. If a sheet with the same
+    name exists, it is replaced.
+    """
+    try:
+        import openpyxl
+        from openpyxl.styles import Font
+    except ImportError:
+        logger.warning("openpyxl required to append campaign mappings")
+        return
+
+    path = Path(combined_xlsx_path)
+    if not path.is_file():
+        logger.warning("CombinedReportAgent: combined analysis file not found: %s", path)
+        return
+
+    try:
+        wb = openpyxl.load_workbook(path, read_only=False)
+    except Exception as e:
+        logger.warning("CombinedReportAgent: could not open workbook %s: %s", path, e)
+        return
+
+    sheet_name = CAMPAIGN_MAPPINGS_SHEET[:31]
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+    ws = wb.create_sheet(sheet_name)
+
+    for col, header in enumerate(CAMPAIGN_MAPPINGS_HEADERS, start=1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.font = Font(bold=True)
+
+    for row_idx, m in enumerate(mappings, start=2):
+        store_id = str(m.get("store_id", "")).strip()
+        min_subtotal = m.get("min_subtotal", 0)
+        slot_tags = m.get("slot_tags") or []
+        if isinstance(slot_tags, (list, tuple)):
+            slot_tags_str = ",".join(str(t).strip() for t in slot_tags)
+        else:
+            slot_tags_str = str(slot_tags).strip()
+        campaign_name = str(m.get("campaign_name", "")).strip()
+        ws.cell(row=row_idx, column=1, value=store_id)
+        ws.cell(row=row_idx, column=2, value=min_subtotal)
+        ws.cell(row=row_idx, column=3, value=slot_tags_str)
+        ws.cell(row=row_idx, column=4, value=campaign_name)
+
+    try:
+        wb.save(path)
+        logger.info(
+            "CombinedReportAgent: Pushed %s campaign mapping(s) to sheet %s in %s",
+            len(mappings),
+            sheet_name,
+            path.name,
+        )
+    except Exception as e:
+        logger.warning("CombinedReportAgent: could not save workbook %s: %s", path, e)
+    finally:
+        wb.close()
 
 
 def run(

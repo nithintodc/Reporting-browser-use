@@ -1,8 +1,8 @@
 """
 MarketingAgent: runs after browser downloads the marketing report. Extracts the download
-(ZIP or folder), runs analysis-app marketing functions (create_corporate_vs_todc_table,
-process_marketing_promotion_files, process_marketing_sponsored_files), and writes
-the final marketing analysis Excel to the downloads folder.
+(ZIP or folder), runs marketing analysis (create_corporate_vs_todc_table and related
+tables), and writes the final marketing analysis Excel to the downloads folder.
+Requires marketing_analysis module on PYTHONPATH or installed.
 """
 
 import logging
@@ -21,7 +21,7 @@ except ImportError:
 
 
 def _mock_streamlit() -> None:
-    """Install a minimal streamlit mock so analysis-app modules can be imported without Streamlit."""
+    """Install a minimal streamlit mock so marketing_analysis can be imported without Streamlit."""
     import types
     mock = types.ModuleType("streamlit")
     mock.error = lambda *a, **k: None
@@ -46,7 +46,7 @@ def _extract_marketing_zip(zip_path: Path, output_dir: Path) -> Optional[Path]:
     Extract marketing ZIP to output_dir/marketing_extract_<timestamp>.
     If ZIP has marketing_* folder(s), return output_dir so find_marketing_folders finds them.
     If ZIP has only CSVs at root, create marketing_report/ and put CSVs there, return extract_dir.
-    Returns path to use as marketing_folder_path for analysis-app.
+    Returns path to use as marketing_folder_path for marketing analysis.
     """
     extract_dir = output_dir / f"marketing_extract_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     extract_dir.mkdir(parents=True, exist_ok=True)
@@ -179,7 +179,7 @@ def run(
 ):
     """
     Run marketing analysis on the downloaded report. If it's a ZIP, extract it first.
-    Uses analysis-app marketing_analysis.create_corporate_vs_todc_table.
+    Uses marketing_analysis.create_corporate_vs_todc_table (module must be on PYTHONPATH).
     If write_file=True, writes marketing_analysis_<timestamp>.xlsx and returns path.
     If write_file=False, returns list of (sheet_name, DataFrame) for combined report.
     """
@@ -208,13 +208,6 @@ def run(
         return None
 
     _mock_streamlit()
-    analysis_app_dir = Path(__file__).resolve().parent.parent / "analysis-app" / "app"
-    if not analysis_app_dir.is_dir():
-        logger.warning("MarketingAgent: analysis-app/app not found at %s", analysis_app_dir)
-        return None
-    if str(analysis_app_dir) not in sys.path:
-        sys.path.insert(0, str(analysis_app_dir))
-
     try:
         from marketing_analysis import (
             create_corporate_vs_todc_table,
@@ -224,6 +217,12 @@ def run(
             get_sponsored_by_store_table,
             get_marketing_by_store_combined,
         )
+    except ImportError as e:
+        logger.warning(
+            "MarketingAgent: marketing_analysis module not available (add to PYTHONPATH or install): %s",
+            e,
+        )
+        return None
     except Exception as e:
         logger.warning("MarketingAgent: Failed to import marketing_analysis: %s", e)
         return None

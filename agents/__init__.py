@@ -10,6 +10,7 @@ from agents.doordash_agent import (
     get_task_description_campaign_only,
     get_task_description_campaign_already_logged_in,
     get_task_description_campaign_for_combo,
+    get_task_description_campaign_for_subtotal_combo,
 )
 from agents.report_storage_agent import ReportStorageAgent
 
@@ -23,5 +24,6 @@ __all__ = [
     "get_task_description_campaign_only",
     "get_task_description_campaign_already_logged_in",
     "get_task_description_campaign_for_combo",
+    "get_task_description_campaign_for_subtotal_combo",
     "ReportStorageAgent",
 ]

@@ -2,10 +2,10 @@
 GooglePusherAgent: push the final financial and marketing analysis Excel reports
 into a single Google Sheets file as separate sheets.
 
-Uses the same credential pattern as analysis-app gdrive_utils:
+Credentials (first match wins):
 - GCP_SERVICE_ACCOUNT_JSON (env, JSON string), or
-- GOOGLE_APPLICATION_CREDENTIALS / GCP_CREDENTIALS_PATH (path to JSON), or
-- default: analysis-app/app/todc-marketing-*.json
+- GCP_CREDENTIALS_PATH / GOOGLE_APPLICATION_CREDENTIALS (path to JSON file), or
+- todc-marketing-*.json in the project root (e.g. todc-marketing-ad02212d4f16.json)
 
 Requires Google Sheets API scope. Creates one spreadsheet with one tab per
 Excel sheet (financial sheets first, then marketing sheets).
@@ -27,17 +27,22 @@ SHEET_TITLE_FORBIDDEN = re.compile(r'[*?\:/\\\[\]]')
 
 
 def _load_credentials():
-    """Load service account credentials (same pattern as analysis-app gdrive_utils, no Streamlit)."""
+    """Load service account credentials from env or todc-marketing-*.json in project root."""
     from google.oauth2 import service_account
 
     credentials_info = None
+    scopes = [
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/spreadsheets",
+    ]
 
     # 1) Environment: JSON string
     if os.environ.get("GCP_SERVICE_ACCOUNT_JSON"):
         try:
             credentials_info = json.loads(os.environ["GCP_SERVICE_ACCOUNT_JSON"])
-        except (json.JSONDecodeError, KeyError):
-            pass
+            logger.info("GooglePusherAgent: Loading credentials from GCP_SERVICE_ACCOUNT_JSON (env)")
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning("GooglePusherAgent: GCP_SERVICE_ACCOUNT_JSON invalid: %s", e)
 
     # 2) File path from env
     credentials_path = None
@@ -46,54 +51,68 @@ def _load_credentials():
     if credentials_info is None and credentials_path:
         credentials_path = Path(credentials_path)
         if credentials_path.exists():
-            return service_account.Credentials.from_service_account_file(
-                str(credentials_path),
-                scopes=[
-                    "https://www.googleapis.com/auth/drive",
-                    "https://www.googleapis.com/auth/spreadsheets",
-                ],
-            )
+            creds = service_account.Credentials.from_service_account_file(str(credentials_path), scopes=scopes)
+            _log_creds_source("GCP_CREDENTIALS_PATH or GOOGLE_APPLICATION_CREDENTIALS", str(credentials_path), creds)
+            return creds
         logger.warning("GooglePusherAgent: Credentials file not found at %s", credentials_path)
 
     # 3) Use credentials from JSON env
     if credentials_info is not None:
-        return service_account.Credentials.from_service_account_info(
-            credentials_info,
-            scopes=[
-                "https://www.googleapis.com/auth/drive",
-                "https://www.googleapis.com/auth/spreadsheets",
-            ],
-        )
+        creds = service_account.Credentials.from_service_account_info(credentials_info, scopes=scopes)
+        _log_creds_source("GCP_SERVICE_ACCOUNT_JSON", "(env string)", creds)
+        return creds
 
     # 4) Project root: todc-marketing-*.json (e.g. todc-marketing-ad02212d4f16.json)
     project_root = Path(__file__).resolve().parent.parent
     for f in project_root.glob("todc-marketing-*.json"):
         if f.is_file():
-            return service_account.Credentials.from_service_account_file(
-                str(f),
-                scopes=[
-                    "https://www.googleapis.com/auth/drive",
-                    "https://www.googleapis.com/auth/spreadsheets",
-                ],
-            )
-
-    # 5) analysis-app/app/todc-marketing-*.json
-    app_dir = project_root / "analysis-app" / "app"
-    if app_dir.is_dir():
-        for f in app_dir.glob("todc-marketing-*.json"):
-            return service_account.Credentials.from_service_account_file(
-                str(f),
-                scopes=[
-                    "https://www.googleapis.com/auth/drive",
-                    "https://www.googleapis.com/auth/spreadsheets",
-                ],
-            )
+            logger.info("GooglePusherAgent: Loading credentials from project root file: %s", f.name)
+            creds = service_account.Credentials.from_service_account_file(str(f), scopes=scopes)
+            _log_creds_source("project root", str(f), creds)
+            return creds
 
     raise FileNotFoundError(
         "Google Sheets credentials not found. Set GCP_SERVICE_ACCOUNT_JSON (JSON string), "
         "GCP_CREDENTIALS_PATH or GOOGLE_APPLICATION_CREDENTIALS (path to JSON), or place "
-        "todc-marketing-*.json in the project root or analysis-app/app."
+        "todc-marketing-*.json in the project root."
     )
+
+
+def _log_creds_source(source: str, path_or_detail: str, creds) -> None:
+    """Log which account/project we're using (no secrets)."""
+    try:
+        if hasattr(creds, "service_account_email"):
+            email = getattr(creds, "service_account_email", "") or ""
+        else:
+            email = (getattr(creds, "_service_account_email", None) or "").strip()
+        logger.info(
+            "GooglePusherAgent: Credentials loaded from %s (%s) — service_account_email=%s",
+            source,
+            path_or_detail,
+            email or "(unknown)",
+        )
+    except Exception:
+        logger.info("GooglePusherAgent: Credentials loaded from %s (%s)", source, path_or_detail)
+
+
+def _log_http_error(operation: str, e: Any) -> None:
+    """Log HttpError with status, reason, and response body for debugging."""
+    try:
+        resp = getattr(e, "resp", None)
+        status_code = getattr(resp, "status", None) if resp is not None else None
+        reason = getattr(e, "reason", None) or (getattr(resp, "reason", None) if resp else None)
+        body = getattr(e, "content", b"") or (getattr(resp, "content", b"") if resp else b"")
+        body_str = (body.decode("utf-8", errors="replace")[:500] if body else "") or "(none)"
+        logger.warning(
+            "GooglePusherAgent: Failed %s — status=%s reason=%s details=%s body=%s",
+            operation,
+            status_code,
+            reason,
+            str(e)[:300],
+            body_str[:300],
+        )
+    except Exception:
+        logger.warning("GooglePusherAgent: Failed %s — %s", operation, e)
 
 
 def _sanitize_sheet_title(title: str) -> str:
@@ -184,6 +203,11 @@ def push_to_sheets(
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
 
+    logger.info(
+        "GooglePusherAgent: Starting push — financial=%s, marketing=%s",
+        financial_xlsx_path,
+        marketing_xlsx_path,
+    )
     order, data = _build_combined_sheets(
         Path(financial_xlsx_path) if financial_xlsx_path else None,
         Path(marketing_xlsx_path) if marketing_xlsx_path else None,
@@ -191,6 +215,7 @@ def push_to_sheets(
     if not order or not data:
         logger.warning("GooglePusherAgent: No sheet data to push (missing or empty Excel files)")
         return None
+    logger.info("GooglePusherAgent: Built %s sheets to push: %s", len(order), order[:5])  # first 5 names
 
     try:
         creds = _load_credentials()
@@ -198,6 +223,7 @@ def push_to_sheets(
         logger.warning("GooglePusherAgent: Skipping push - %s", e)
         return None
 
+    logger.info("GooglePusherAgent: Building Sheets API client (sheets v4)...")
     sheets_service = build("sheets", "v4", credentials=creds)
 
     if not spreadsheet_title:
@@ -209,14 +235,16 @@ def push_to_sheets(
         "properties": {"title": spreadsheet_title[:SHEET_TITLE_MAX_LEN]},
         "sheets": sheet_properties,
     }
+    logger.info("GooglePusherAgent: Creating spreadsheet title=%s, sheets=%s", spreadsheet_title, len(order))
     try:
         create_res = sheets_service.spreadsheets().create(body=body).execute()
     except HttpError as e:
-        logger.warning("GooglePusherAgent: Failed to create spreadsheet: %s", e)
+        _log_http_error("create spreadsheet", e)
         return None
 
     spreadsheet_id = create_res["spreadsheetId"]
     spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+    logger.info("GooglePusherAgent: Spreadsheet created id=%s url=%s", spreadsheet_id, spreadsheet_url)
 
     # Write data to each sheet
     value_ranges = []
@@ -230,13 +258,15 @@ def push_to_sheets(
         value_ranges.append({"range": range_name, "values": rows})
 
     if value_ranges:
+        logger.info("GooglePusherAgent: Writing data to %s sheet(s) (batchUpdate)...", len(value_ranges))
         try:
             sheets_service.spreadsheets().values().batchUpdate(
                 spreadsheetId=spreadsheet_id,
                 body={"valueInputOption": "USER_ENTERED", "data": value_ranges},
             ).execute()
+            logger.info("GooglePusherAgent: batchUpdate completed successfully")
         except HttpError as e:
-            logger.warning("GooglePusherAgent: Failed to write sheet values: %s", e)
+            _log_http_error("batchUpdate (write values)", e)
             # Spreadsheet was created; still return link
     logger.info("GooglePusherAgent: Pushed %s sheets to %s", len(order), spreadsheet_url)
     return {
