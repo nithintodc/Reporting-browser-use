@@ -16,6 +16,11 @@ from agents.slack_agent import push_to_slack
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# NOT IN MAIN FLOW — Full task: login + reports + download + single campaign
+# (Flow uses: login → reports → download → analysis → campaigns with subtotal+tags)
+# =============================================================================
+'''
 def get_task_description(
     email: str,
     password: str,
@@ -24,10 +29,15 @@ def get_task_description(
     store_search: str,
     store_name: str,
     campaign_name: str,
+    min_subtotal: int = 10,
+    slot_tags: Optional[list] = None,
 ) -> str:
     """Build the agent task with credentials and date range."""
     if not password:
         raise ValueError("DOORDASH_PASSWORD is not set. Add it to your .env file (see .env.example).")
+    tags_list = [int(t) for t in (slot_tags or []) if t is not None and str(t).strip() != ""]
+    _tags_str = ", ".join(str(t) for t in sorted(tags_list)) if tags_list else ""
+    _sched_extra = f" In the schedule grid, check ONLY the cells that correspond to these tag numbers: {_tags_str}. Each cell has a tag (1–42)." if _tags_str else ""
 
     return f"""
 You are automating the DoorDash Merchant Portal. Complete the following steps in order.
@@ -81,12 +91,12 @@ If you get stuck at any step below (modal does not open, action has no effect): 
     - Select ONLY "{store_name}" from the results.
     - Click "Save".
 
-24. Edit Customer incentive: In the right panel, scroll so "Customer incentive" is visible. Click the EDIT (pencil) that belongs to "Customer incentive" only. If the modal does not open, wait 3s, scroll to center "Customer incentive", click its Edit again. Then: Wait 2s. Click "15%" radio. Wait 2s. Under "Minimum subtotal" click "Custom". Wait 2s. Clear the text box. Wait 2s. Enter the required value (e.g. 10). Wait 4s. MANDATORY before Save: Under "Maximum discount amount" there are three buttons (e.g. $6, $8, $10). Click the LEFTMOST (smallest amount). Do NOT click Save until the smallest is selected. Wait 4s. Only then click "Save". Wait 2s.
+24. Edit Customer incentive: In the right panel, scroll so "Customer incentive" is visible. Click the EDIT (pencil) that belongs to "Customer incentive" only. If the modal does not open, wait 3s, scroll to center "Customer incentive", click its Edit again. Then: Wait 2s. Click "15%" radio. Wait 2s. Under "Minimum subtotal" click "Custom". Wait 2s. Clear the text box. Wait 2s. Enter {min_subtotal}. Wait 4s. MANDATORY before Save: Under "Maximum discount amount" there are three buttons (e.g. $6, $8, $10). Click the LEFTMOST (smallest amount). Do NOT click Save until the smallest is selected. Wait 4s. Only then click "Save". Wait 2s.
 
 25. Edit Scheduling:
     - Click the EDIT (pencil) icon next to "Scheduling".
-    - Choose "Set a custom schedule". A modal "Set custom schedule" will open with a grid of days and time slots (rows = slots, columns = days). 
-    - To clear all selections efficiently: click the "Weekdays" button at the top (this deselects Mon–Fri), then click the "Weekends" button (this deselects Sat–Sun). Do NOT click each day cell one by one.
+    - Choose "Set a custom schedule". A modal "Set custom schedule" will open with a grid of days and time slots (rows = slots, columns = days). Grid columns use day names from slots.csv: Mon, Tue, Wed, Thur, Fri, Sat, Sun.
+    - To clear all selections efficiently: click the "Weekdays" button at the top (this deselects Mon–Fri), then click the "Weekends" button (this deselects Sat–Sun). Do NOT click each day cell one by one.{_sched_extra}
     
     When selecting cells, always go LEFT TO RIGHT within each row, then the next row again left to right. Do NOT go column by column (top to bottom).
     - Click "Save" at the bottom of the modal. Wait 2 seconds.
@@ -101,8 +111,10 @@ If you get stuck at any step below (modal does not open, action has no effect): 
 === DONE ===
 When all steps are complete, use the done action to finish. Summarize what was done: login, both reports created, both reports downloaded, and campaign "{campaign_name}" created.
 """
+'''
 
 
+# --- IN USE: Login → Report creation → Report download (Phase 1 of main flow) ---
 def get_task_description_reports_only(
     email: str,
     password: str,
@@ -143,16 +155,26 @@ When both reports are downloaded, use the done action to finish. Summarize: logi
 """
 
 
+# =============================================================================
+# NOT IN MAIN FLOW — Login + single campaign only (store_search, store_name, campaign_name)
+# =============================================================================
+'''
 def get_task_description_campaign_only(
     email: str,
     password: str,
     store_search: str,
     store_name: str,
     campaign_name: str,
+    min_subtotal: int = 10,
+    slot_tags: Optional[list] = None,
 ) -> str:
     """Task that does login then only campaign creation (reports already done)."""
     if not password:
         raise ValueError("DOORDASH_PASSWORD is not set. Add it to your .env file (see .env.example).")
+    tags_list = [int(t) for t in (slot_tags or []) if t is not None and str(t).strip() != ""]
+    _tags_str = ", ".join(str(t) for t in sorted(tags_list)) if tags_list else ""
+    _sched_extra = f" In the schedule grid, check ONLY the cells that correspond to these tag numbers: {_tags_str}. Each cell has a tag (1–42). Grid columns use day names from slots.csv: Mon, Tue, Wed, Thur, Fri, Sat, Sun." if _tags_str else ""
+
     return f"""
 You are automating the DoorDash Merchant Portal. You are already done with reports; now only create the marketing campaign. Complete the following in order.
 
@@ -167,9 +189,9 @@ If you get stuck at any step below: in the LEFT SIDEBAR click "Marketing" then "
 
 5. Edit Stores: click EDIT (pencil) next to "Stores". Click "Select All" to clear. In the search bar type: {store_search}. Select ONLY "{store_name}". Click "Save".
 
-6. Set customer incentive: In the right panel, scroll so "Customer incentive" is visible. Click the Edit (pencil) next to "Customer incentive" only. If the modal does not open, wait 3s, scroll, click its Edit again. Wait 2s. Click "15%" radio. Under "Minimum subtotal" click "Custom". Wait 2s. Clear the text box. Wait 2s. Enter 10. Wait 4s. MANDATORY before Save: Under "Maximum discount amount" there are three buttons (e.g. $6, $8, $10). Click the LEFTMOST (smallest). Do NOT click Save until the smallest is selected. Wait 4s. Only then click "Save". Wait 2s.
+6. Set customer incentive: In the right panel, scroll so "Customer incentive" is visible. Click the Edit (pencil) next to "Customer incentive" only. If the modal does not open, wait 3s, scroll, click its Edit again. Wait 2s. Click "15%" radio. Under "Minimum subtotal" click "Custom". Wait 2s. Clear the text box. Wait 2s. Enter {min_subtotal}. Wait 4s. MANDATORY before Save: Under "Maximum discount amount" there are three buttons (e.g. $6, $8, $10). Click the LEFTMOST (smallest). Do NOT click Save until the smallest is selected. Wait 4s. Only then click "Save". Wait 2s.
 
-7. Edit Scheduling: EDIT (pencil). Choose "Set a custom schedule". Click "Weekdays" then "Weekends" to deselect all. In the grid (rows = slots, columns = days), always go LEFT TO RIGHT within each row, then next row left to right; do NOT go column by column. Click "Save". Wait 2 seconds.
+7. Edit Scheduling: click EDIT (pencil) next to "Scheduling". Choose "Set a custom schedule". Click "Weekdays" then "Weekends" to deselect all.{_sched_extra} In the grid (rows = slots, columns = days), always go LEFT TO RIGHT within each row, then next row left to right; do NOT go column by column. Click "Save". Wait 2 seconds.
 
 8. Verify Customer incentive (Maximum discount amount): Open "Customer incentive" again (click its EDIT (pencil)). In the modal, set "Maximum discount amount" to the smallest value (click the LEFTMOST of the three buttons). Click "Save". This verifies the setting even if it was missed earlier. Wait 2 seconds.
 
@@ -180,14 +202,25 @@ If you get stuck at any step below: in the LEFT SIDEBAR click "Marketing" then "
 === DONE ===
 When the campaign is created, use the done action to finish. Summarize: login and campaign "{campaign_name}" created.
 """
+'''
 
 
+# =============================================================================
+# NOT IN MAIN FLOW — Campaign when already logged in (single store, single campaign name)
+# =============================================================================
+'''
 def get_task_description_campaign_already_logged_in(
     store_search: str,
     store_name: str,
     campaign_name: str,
+    min_subtotal: int = 10,
+    slot_tags: Optional[list] = None,
 ) -> str:
     """Task for campaign creation when already logged in (same browser session). No login steps."""
+    tags_list = [int(t) for t in (slot_tags or []) if t is not None and str(t).strip() != ""]
+    _tags_str = ", ".join(str(t) for t in sorted(tags_list)) if tags_list else ""
+    _sched_extra = f" In the schedule grid, check ONLY the cells that correspond to these tag numbers: {_tags_str}. Each cell has a tag (1–42). Grid columns use day names from slots.csv: Mon, Tue, Wed, Thur, Fri, Sat, Sun." if _tags_str else ""
+
     return f"""
 CRITICAL — Scope: You are already logged in. Do NOT go to login or run reports. Perform ONLY the campaign steps below. Do NOT click any button not explicitly mentioned in this prompt.
 When clicking Edit (pencil): identify the correct one by section ("Customer incentive" vs "Stores" etc). If a click does not open the expected modal, scroll the right panel so that section is visible and click that section's Edit again — do not repeatedly click the same index. If you get stuck at any intermediate step (modal does not open, action has no effect): in the LEFT SIDEBAR click "Marketing" then "Run a campaign" again, wait for the page to load, click "Customize your campaign" in the right panel, then continue from the step where you were stuck. In "Set customer incentive": you MUST select the smallest "Maximum discount amount" (leftmost of the three buttons) before clicking Save.
@@ -198,9 +231,9 @@ Create the marketing campaign: {campaign_name}
 
 2. Edit Stores: click EDIT (pencil) next to "Stores". Click "Select All" to clear all selected stores. Wait until unselected. In the search bar type: {store_search}. Select ONLY "{store_name}". Click "Save".
 
-3. Set customer incentive: In the right panel, scroll so "Customer incentive" is visible. Click the Edit (pencil) next to "Customer incentive" only. If the modal does not open, wait 3s, scroll, click its Edit again. Wait 2s. Click "15%" radio. Under "Minimum subtotal" click "Custom". Wait 2s. Clear the text box. Wait 2s. Enter the value (e.g. 10). Wait 4s. MANDATORY before Save: Under "Maximum discount amount" there are three buttons (e.g. $6, $8, $10). Click the LEFTMOST (smallest). Do NOT click Save until the smallest is selected. Wait 4s. Only then click "Save". Wait 2s.
+3. Set customer incentive: In the right panel, scroll so "Customer incentive" is visible. Click the Edit (pencil) next to "Customer incentive" only. If the modal does not open, wait 3s, scroll, click its Edit again. Wait 2s. Click "15%" radio. Under "Minimum subtotal" click "Custom". Wait 2s. Clear the text box. Wait 2s. Enter {min_subtotal}. Wait 4s. MANDATORY before Save: Under "Maximum discount amount" there are three buttons (e.g. $6, $8, $10). Click the LEFTMOST (smallest). Do NOT click Save until the smallest is selected. Wait 4s. Only then click "Save". Wait 2s.
 
-4. Edit Scheduling: click EDIT (pencil) next to "Scheduling". Choose "Set a custom schedule". In the modal: click "Weekdays" to deselect weekdays, "Weekends" to deselect weekends. In the grid (rows = slots, columns = days), go LEFT TO RIGHT within each row, then next row left to right; do NOT go column by column. Click "Save". Wait 2 seconds.
+4. Edit Scheduling: click EDIT (pencil) next to "Scheduling". Choose "Set a custom schedule". In the modal: click "Weekdays" to deselect weekdays, "Weekends" to deselect weekends.{_sched_extra} In the grid (rows = slots, columns = days), go LEFT TO RIGHT within each row, then next row left to right; do NOT go column by column. Click "Save". Wait 2 seconds.
 
 5. Verify Customer incentive (Maximum discount amount): Open "Customer incentive" again (click its EDIT (pencil)). In the modal, set "Maximum discount amount" to the smallest value (click the LEFTMOST of the three buttons). Click "Save". This verifies the setting even if it was missed earlier. Wait 2 seconds.
 
@@ -210,62 +243,10 @@ Create the marketing campaign: {campaign_name}
 
 When the campaign is created, use the done action to finish. Summarize: campaign "{campaign_name}" created.
 """
+'''
 
 
-def get_task_description_campaign_for_combo(combo: dict) -> str:
-    """
-    Build campaign task for one (store_id, day, slot, min_subtotal, campaign_name) from combined_analysis.
-    For use when already logged in (same browser session). Combo dict has keys:
-    store_id, day, slot, min_subtotal, campaign_name (e.g. TODC-{StoreID}-Monday-Breakfast).
-    """
-    store_id = str(combo.get("store_id", "")).strip()
-    day = str(combo.get("day", "")).strip()
-    slot = str(combo.get("slot", "")).strip()
-    min_subtotal = combo.get("min_subtotal", 10)
-    try:
-        min_subtotal = int(round(float(min_subtotal)))
-    except (TypeError, ValueError):
-        min_subtotal = 10
-    campaign_name = str(combo.get("campaign_name", f"TODC-{store_id}-{day}-{slot}")).strip()
-
-    # Day short form for UI (e.g. Monday -> Mon, Tuesday -> Tue)
-    day_short = day[:3] if len(day) >= 3 else day
-
-    return f"""
-CRITICAL — Scope: You are already logged in to the DoorDash Merchant Portal. Do NOT go to the login page. Do NOT run reports or download anything. Perform ONLY the campaign creation steps below. Do NOT click any button that is not explicitly mentioned in this prompt.
-When clicking Edit (pencil) buttons: identify the correct one by the section it belongs to (e.g. "Customer incentive" vs "Stores"). If a click does not open the expected modal, scroll the right panel so that section is visible and click that section's Edit again — do not repeatedly click the same element index. If you get stuck at any intermediate step (modal does not open, action has no effect): in the LEFT SIDEBAR click "Marketing" then "Run a campaign" again, wait for the page to load, click "Customize your campaign" in the right panel, then start again.
-In the schedule grid: always go LEFT TO RIGHT within each row, then the next row again left to right. Do NOT go column by column (top to bottom).
-
-Create this campaign (exactly one store, one day, one slot): {campaign_name}
-
-1. Go to campaign selection: In the LEFT SIDEBAR, click "Marketing", then "Run a campaign". Wait for the page to load. Do NOT click the red "Get started" button (that is for "Buy 1, get 1 free" at the top — never click it). Find the "Discount for all customers" card (in the "Recommended for you" section) and click ONLY that card's "Select" button. A right side panel will appear. In that panel, click "Customize your campaign" to open the campaign setup form. Do not click any other buttons.
-
-2. Edit Stores: click EDIT (pencil) next to "Stores". Click "Select All" to clear all selected stores. Wait until all stores are unselected. NEVER search before clearing selections. In the search bar type: {store_id}. Select ONLY the store that contains "{store_id}" (e.g. McDonald's ({store_id} - ...)). Click "Save".
-
-3. Set customer incentive — follow this order exactly, with waits:
-   - Opening the modal (critical): In the RIGHT side panel, scroll so the section labeled "Customer incentive" is fully visible. Click ONLY the Edit (pencil) that belongs to "Customer incentive" (next to that heading), NOT the Edit for Stores, Scheduling, or Campaign name. Identify by context: the correct pencil is in the same block as the text "Customer incentive". If the "Set customer incentive" modal does NOT open (you do not see "15%", "Minimum subtotal", "Custom"), wait 3 seconds, scroll the panel to bring "Customer incentive" into view, and click that section's Edit again once. Wait 2 seconds.
-   - Click the "15%" radio button (percentage discount). Wait 2 seconds.
-   - Under "Minimum subtotal", click the "Custom" button (one of the four options: $17, $25, $34, Custom). Wait 2 seconds.
-   - Clear any value in the Custom minimum-subtotal text box. Wait 2 seconds.
-   - Enter {min_subtotal} in that text box. Wait 4 seconds.
-   - Maximum discount amount (MANDATORY — do this before Save): Find the section "Maximum discount amount". There are THREE buttons (e.g. $6, $8, $10). You MUST click the button with the SMALLEST dollar value (the LEFTMOST button). Do NOT click Save until the smallest amount is selected. If middle or right button is selected, click the LEFTMOST button to switch to the minimum. Wait 4 seconds after selecting it.
-   - Only after the above: click "Save" at the bottom of the modal. Wait 2 seconds.
-
-4. Edit Scheduling: click EDIT (pencil) next to "Scheduling". Choose "Set a custom schedule". In the modal:
-   - Click the "Weekdays" button to deselect all weekday slots. Click the "Weekends" button to deselect all weekend slots.
-   - Then select ONLY the single combination: Day = {day} ({day_short}) and Slot = {slot}. In the grid (rows = slots, columns = days), check only the cell where column {day_short} meets row {slot}. When scanning the grid, always go left to right by row, then next row left to right; do not go column by column.
-   - Click "Save". Wait 2 seconds.
-
-5. Verify Customer incentive (Maximum discount amount): Open the "Customer incentive" module again (click the EDIT (pencil) next to "Customer incentive"). In the modal, set "Maximum discount amount" to the smallest value (click the LEFTMOST of the three buttons). Click "Save". This verifies the setting even if it was missed in step 3. Wait 2 seconds.
-
-6. Set campaign name: click the EDIT (pencil) next to "Campaign name". Remove ALL existing text in the field. Type exactly: {campaign_name}. Click "Save" inside the Campaign name module. Wait for confirmation that the name is saved.
-
-7. Create promotion (only after step 6 is done): ONLY AFTER the campaign name is saved, click the "Create promotion" button at the bottom. Never click "Create promotion" before setting and saving the campaign name.
-
-When the campaign is created, use the done action to finish. Summarize: campaign "{campaign_name}" created.
-"""
-
-
+# --- IN USE: Campaign creation with subtotal + slot tags (Phase 2, per store per subtotal) ---
 def get_task_description_campaign_for_subtotal_combo(combo: dict) -> str:
     """
     Build campaign task for one (store_id, min_subtotal, slot_tags) from slots.csv.
@@ -308,7 +289,7 @@ Create this campaign (one store, one minimum subtotal, multiple slots): {campaig
 
 4. Edit Scheduling: click EDIT (pencil) next to "Scheduling". Choose "Set a custom schedule". In the modal:
    - Click the "Weekdays" button to deselect all weekday slots. Click the "Weekends" button to deselect all weekend slots.
-   - In the schedule grid, check ALL cells that correspond to these tag numbers: {tags_str}. Each cell in the grid has a tag number (1–42). Check every cell whose tag is in this list; leave all other cells unchecked. CRITICAL — When selecting cells, always go LEFT TO RIGHT within each row, then move to the next row and again left to right. Do NOT go column by column (top to bottom). Rows = time slots (e.g. Early morning, Breakfast), columns = days (Mon, Tue, …). Traverse row by row: first row left→right, then second row left→right, and so on.
+   - In the schedule grid, check ALL cells that correspond to these tag numbers: {tags_str}. Each cell in the grid has a tag number (1–42). Check every cell whose tag is in this list; leave all other cells unchecked. Grid columns use day names from slots.csv (columns 2–8): Mon, Tue, Wed, Thur, Fri, Sat, Sun. CRITICAL — When selecting cells, always go LEFT TO RIGHT within each row, then move to the next row and again left to right. Do NOT go column by column (top to bottom). Rows = time slots (e.g. Early morning, Breakfast). Traverse row by row: first row left→right, then second row left→right, and so on.
    - Click "Save". Wait 2 seconds.
 
 5. Verify Customer incentive (Maximum discount amount): Open the "Customer incentive" module again (click the EDIT (pencil) next to "Customer incentive"). In the modal, set "Maximum discount amount" to the smallest value (click the LEFTMOST of the three buttons). Click "Save". This verifies the setting even if it was missed in step 3. Wait 2 seconds.
@@ -436,6 +417,43 @@ async def run_reports_only(
     return (marketing_path, financial_path)
 
 
+# =============================================================================
+# NOT IN MAIN FLOW — Standalone: login + report creation + download only
+# =============================================================================
+'''
+async def run_reports_only(
+    download_dir: Path,
+    email: str,
+    password: str,
+    start_date: str,
+    end_date: str,
+) -> Tuple[Optional[Path], Optional[Path]]:
+    """
+    Run only login + report creation + download. Stops before campaign.
+    Returns (marketing_download_path, financial_download_path) for analysis agents.
+    """
+    download_dir = Path(download_dir)
+    task = get_task_description_reports_only(
+        email=email,
+        password=password,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    logger.info("DoorDash (browser-use): Starting reports-only run (login, reports, download)")
+    await _run_agent(download_dir, task)
+    marketing_path, financial_path = _discover_downloads(download_dir)
+    if financial_path:
+        logger.info("DoorDash (browser-use): Financial report at %s", financial_path)
+    if marketing_path:
+        logger.info("DoorDash (browser-use): Marketing report at %s", marketing_path)
+    return (marketing_path, financial_path)
+'''
+
+
+# =============================================================================
+# NOT IN MAIN FLOW — Standalone: login + single campaign only
+# =============================================================================
+'''
 async def run_campaign_only(
     download_dir: Path,
     email: str,
@@ -443,6 +461,8 @@ async def run_campaign_only(
     store_search: str,
     store_name: str,
     campaign_name: str,
+    min_subtotal: int = 10,
+    slot_tags: Optional[list] = None,
 ) -> None:
     """
     Run only login + campaign creation. Use after reports are downloaded and analysis/combined report have run.
@@ -454,11 +474,15 @@ async def run_campaign_only(
         store_search=store_search,
         store_name=store_name,
         campaign_name=campaign_name,
+        min_subtotal=min_subtotal,
+        slot_tags=slot_tags,
     )
     logger.info("DoorDash (browser-use): Starting campaign-only run")
     await _run_agent(download_dir, task)
+'''
 
 
+# --- IN USE: Main flow — Login → Reports → Download → Analysis → Campaigns (subtotal+tags) for all stores/subtotals ---
 async def run_reports_then_analysis_then_campaign(
     download_dir: Path,
     email: str,
@@ -576,11 +600,7 @@ async def run_reports_then_analysis_then_campaign(
                 "slots.csv" if use_slots_csv else "combined_analysis",
             )
             for i, combo in enumerate(combos, 1):
-                task = (
-                    get_task_description_campaign_for_subtotal_combo(combo)
-                    if use_slots_csv
-                    else get_task_description_campaign_for_combo(combo)
-                )
+                task = get_task_description_campaign_for_subtotal_combo(combo)
                 agent.add_new_task(task)
                 
                 campaign_name = str(combo.get("campaign_name", ""))
@@ -594,9 +614,25 @@ async def run_reports_then_analysis_then_campaign(
                 push_to_slack(f"{campaign_name} setup in progress — {detail}")
                 
                 try:
-                    await agent.run()
-                    status = "Completed"
-                    push_to_slack(f"{campaign_name} — done")
+                    history = await agent.run()
+                    # When browser-use hits max_failures it stops without raising; treat as failed if not clearly successful
+                    completed_ok = True
+                    if history is not None:
+                        if hasattr(history, "is_successful") and callable(history.is_successful):
+                            completed_ok = history.is_successful()
+                        elif hasattr(history, "final_result"):
+                            val = history.final_result
+                            completed_ok = val is not None and (val() if callable(val) else val)
+                    if completed_ok:
+                        status = "Completed"
+                        push_to_slack(f"{campaign_name} — done")
+                    else:
+                        status = "Failed"
+                        push_to_slack(f"{campaign_name} — failed (agent stopped without completing)")
+                        logger.warning(
+                            "Campaign %s: agent run stopped (e.g. consecutive failures) without completing.",
+                            combo.get("campaign_name"),
+                        )
                 except Exception as e:
                     logger.warning("Campaign %s failed: %s", combo.get("campaign_name"), e)
                     status = "Failed"
@@ -637,6 +673,10 @@ async def run_reports_then_analysis_then_campaign(
         logger.debug("Browser close/kill: %s", e)
 
 
+# =============================================================================
+# NOT IN MAIN FLOW — Convenience: reports-only (main flow is run_reports_then_analysis_then_campaign)
+# =============================================================================
+'''
 async def run(
     download_dir: Path,
     email: str,
@@ -649,7 +689,7 @@ async def run(
 ) -> Tuple[Optional[Path], Optional[Path]]:
     """
     Run reports-only then return paths (convenience alias for run_reports_only).
-    For full flow with analysis in between, use run_reports_only → analysis → run_campaign_only from main.
+    For full flow with analysis in between, use run_reports_then_analysis_then_campaign.
     """
     return await run_reports_only(
         download_dir=download_dir,
@@ -658,3 +698,4 @@ async def run(
         start_date=start_date,
         end_date=end_date,
     )
+'''
