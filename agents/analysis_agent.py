@@ -42,6 +42,13 @@ def _extract_financial_detailed_csv(zip_path: Path, output_dir: Path) -> Optiona
 
 
 def _get_time_slot(time_str) -> Optional[str]:
+    # Slot boundaries (minutes from midnight):
+    #   Early morning:  0:00 – 4:59   (0   – 299)
+    #   Breakfast:      5:00 – 10:59  (300 – 659)
+    #   Lunch:         11:00 – 13:59  (660 – 839)
+    #   Afternoon:     14:00 – 15:59  (840 – 959)
+    #   Dinner:        16:00 – 19:59  (960 – 1199)
+    #   Late night:    20:00 – 23:59  (1200+)
     if pd.isna(time_str) or time_str == "":
         return None
     try:
@@ -49,18 +56,17 @@ def _get_time_slot(time_str) -> Optional[str]:
         if pd.isna(time_obj):
             return None
         total_minutes = time_obj.hour * 60 + time_obj.minute
-        if total_minutes >= 0 and total_minutes < 300:
+        if total_minutes < 300:
             return "Early morning"
-        if total_minutes >= 300 and total_minutes < 659:
+        if total_minutes < 660:
             return "Breakfast"
-        if total_minutes >= 659 and total_minutes < 839:
+        if total_minutes < 840:
             return "Lunch"
-        if total_minutes >= 839 and total_minutes < 959:
+        if total_minutes < 960:
             return "Afternoon"
-        if total_minutes >= 959 and total_minutes < 1159:
+        if total_minutes < 1200:
             return "Dinner"
-        if total_minutes >= 1159:
-            return "Late night"
+        return "Late night"
     except Exception:
         pass
     return None
@@ -90,6 +96,7 @@ def _resolve_columns(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str], Op
 
 # Canonical column name for store identifier in outputs (financial raw data uses "Merchant store ID")
 MERCHANT_STORE_ID_LABEL = "Merchant Store ID"
+STORE_NAME_LABEL = "Store Name"
 
 
 def _resolve_store_col(df: pd.DataFrame) -> Optional[str]:
@@ -99,6 +106,26 @@ def _resolve_store_col(df: pd.DataFrame) -> Optional[str]:
         if c in df.columns:
             return c
     return None
+
+
+def _resolve_store_name_col(df: pd.DataFrame) -> Optional[str]:
+    """Return store name column name if present."""
+    df.columns = df.columns.str.strip()
+    for c in ["Store name", "Store Name", "Business name", "Business Name"]:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _build_store_id_to_name(df: pd.DataFrame, store_col: str, store_name_col: str) -> dict:
+    """Build a mapping from store ID to store name from the raw data."""
+    mapping = {}
+    for _, row in df[[store_col, store_name_col]].drop_duplicates(subset=[store_col]).iterrows():
+        sid = row[store_col]
+        name = row[store_name_col]
+        if pd.notna(sid) and pd.notna(name):
+            mapping[str(sid).strip()] = str(name).strip()
+    return mapping
 
 
 def _format_dollar_columns(df: pd.DataFrame, dollar_cols: list) -> pd.DataFrame:
@@ -263,8 +290,9 @@ def _build_store_metrics(
     subtotal_col: str,
     payout_col: str,
     order_col: Optional[str],
+    store_id_to_name: Optional[dict] = None,
 ) -> pd.DataFrame:
-    """Per-store: Merchant Store ID, Sales, Payouts, Orders, AOV, Profitability."""
+    """Per-store: Merchant Store ID, Store Name, Sales, Payouts, Orders, AOV, Profitability."""
     df = df.copy()
     df[subtotal_col] = pd.to_numeric(df[subtotal_col], errors="coerce").fillna(0)
     df[payout_col] = pd.to_numeric(df[payout_col], errors="coerce").fillna(0)
@@ -276,6 +304,9 @@ def _build_store_metrics(
     agg = agg.rename(columns={store_col: MERCHANT_STORE_ID_LABEL})
     agg["Profitability"] = (agg["Payouts"] / agg["Sales"].replace(0, float("nan")) * 100).round(2)
     agg["AOV"] = (agg["Sales"] / agg["Orders"].replace(0, float("nan"))).round(2)
+    if store_id_to_name:
+        agg[STORE_NAME_LABEL] = agg[MERCHANT_STORE_ID_LABEL].astype(str).str.strip().map(store_id_to_name).fillna("")
+        return agg[[MERCHANT_STORE_ID_LABEL, STORE_NAME_LABEL, "Sales", "Payouts", "Profitability", "Orders", "AOV"]]
     return agg[[MERCHANT_STORE_ID_LABEL, "Sales", "Payouts", "Profitability", "Orders", "AOV"]]
 
 
@@ -427,6 +458,12 @@ def run(
         return None
 
     store_col = _resolve_store_col(df)
+    store_name_col = _resolve_store_name_col(df)
+    store_id_to_name: dict = {}
+    if store_col and store_name_col:
+        store_id_to_name = _build_store_id_to_name(df, store_col, store_name_col)
+        logger.info("AnalysisAgent: Built store ID→name mapping for %d stores", len(store_id_to_name))
+
     date_wise = _build_date_wise(df, date_col, subtotal_col, payout_col, order_col or subtotal_col)
     day_of_week = _build_day_of_week(df, date_col, subtotal_col, payout_col, order_col or subtotal_col)
     slot_table = _build_slot_based(df, time_col, subtotal_col, payout_col, order_col) if time_col else pd.DataFrame()
@@ -440,7 +477,7 @@ def run(
                 tbl = _format_dollar_columns(tbl, [c for c in DOLLAR_COLS + ["uplift"] if c in tbl.columns])
                 sheet_name = f"Day-Slot - {store_id}"[:31]
                 day_slot_per_store.append((sheet_name, tbl))
-    store_metrics = _build_store_metrics(df, store_col, subtotal_col, payout_col, order_col) if store_col else pd.DataFrame()
+    store_metrics = _build_store_metrics(df, store_col, subtotal_col, payout_col, order_col, store_id_to_name) if store_col else pd.DataFrame()
     store_wise = store_metrics.copy()
     campaign_recs = _build_campaign_recommendations(store_metrics) if not store_metrics.empty else pd.DataFrame()
     if not campaign_recs.empty:

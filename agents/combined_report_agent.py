@@ -10,9 +10,12 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
-# Sheet name and headers for campaign mappings (store → min_subtotal → slot tags)
+# Sheet name and headers for campaign mappings (store → min_subtotal → slot tags → status)
 CAMPAIGN_MAPPINGS_SHEET = "Campaign Mappings"
-CAMPAIGN_MAPPINGS_HEADERS = ("Store ID", "Minimum Subtotal", "Slot Tags", "Campaign Name")
+CAMPAIGN_MAPPINGS_HEADERS = ("Store ID", "Store Name", "Minimum Subtotal", "Slot Tags", "Campaign Name", "Status")
+# Column indices (1-based) inside Campaign Mappings sheet
+_COL_CAMPAIGN_NAME = 5   # E
+_COL_STATUS = 6          # F
 
 try:
     import pandas as pd
@@ -74,7 +77,7 @@ def write_combined_report(
         if not xlsx_path or not Path(xlsx_path).is_file():
             continue
         try:
-            wb_src = openpyxl.load_workbook(xlsx_path, read_only=False, data_only=True)
+            wb_src = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
         except Exception as e:
             logger.warning("Could not open %s: %s", xlsx_path, e)
             continue
@@ -171,6 +174,89 @@ def write_combined_from_sheets(
     return out_path
 
 
+def read_campaign_mapping_statuses(combined_xlsx_path: Path) -> Dict[str, str]:
+    """
+    Read the Campaign Mappings sheet and return {campaign_name: status}.
+    Used before rewriting the sheet so existing statuses are preserved across retries.
+    Returns empty dict if the sheet doesn't exist yet.
+    """
+    try:
+        import openpyxl
+    except ImportError:
+        return {}
+
+    path = Path(combined_xlsx_path)
+    if not path.is_file():
+        return {}
+
+    try:
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    except Exception:
+        return {}
+
+    try:
+        sheet_name = CAMPAIGN_MAPPINGS_SHEET[:31]
+        if sheet_name not in wb.sheetnames:
+            return {}
+        ws = wb[sheet_name]
+        statuses: Dict[str, str] = {}
+        for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            if row_idx == 1:
+                continue  # skip header
+            if not row or len(row) < _COL_CAMPAIGN_NAME or not row[_COL_CAMPAIGN_NAME - 1]:
+                continue
+            campaign_name = str(row[_COL_CAMPAIGN_NAME - 1]).strip()
+            status = str(row[_COL_STATUS - 1]).strip() if len(row) >= _COL_STATUS and row[_COL_STATUS - 1] else "Pending"
+            if campaign_name:
+                statuses[campaign_name] = status
+        return statuses
+    finally:
+        wb.close()
+
+
+def update_campaign_mapping_status(combined_xlsx_path: Path, campaign_name: str, status: str) -> None:
+    """
+    Write status to column E for the matching campaign_name row in Campaign Mappings sheet.
+    Called live after each campaign attempt so reruns can skip completed ones.
+    """
+    try:
+        import openpyxl
+    except ImportError:
+        return
+
+    path = Path(combined_xlsx_path)
+    if not path.is_file():
+        logger.warning("CombinedReportAgent: file not found for status update: %s", path)
+        return
+
+    try:
+        wb = openpyxl.load_workbook(path, read_only=False, data_only=True)
+    except Exception as e:
+        logger.warning("CombinedReportAgent: could not open %s for status update: %s", path, e)
+        return
+
+    try:
+        sheet_name = CAMPAIGN_MAPPINGS_SHEET[:31]
+        if sheet_name not in wb.sheetnames:
+            logger.warning("CombinedReportAgent: Campaign Mappings sheet not in %s", path.name)
+            return
+        ws = wb[sheet_name]
+        for row in ws.iter_rows(min_row=2):
+            name_cell = row[_COL_CAMPAIGN_NAME - 1] if len(row) >= _COL_CAMPAIGN_NAME else None
+            if name_cell and str(name_cell.value or "").strip() == campaign_name:
+                # Extend row to column E if needed
+                status_cell = ws.cell(row=name_cell.row, column=_COL_STATUS)
+                status_cell.value = status
+                wb.save(path)
+                logger.info("CombinedReportAgent: %s → %s", campaign_name, status)
+                return
+        logger.warning("CombinedReportAgent: campaign '%s' not found in mappings for status update", campaign_name)
+    except Exception as e:
+        logger.warning("CombinedReportAgent: status update failed for %s: %s", campaign_name, e)
+    finally:
+        wb.close()
+
+
 def append_campaign_mappings_to_workbook(
     combined_xlsx_path: Path,
     mappings: List[Dict[str, Any]],
@@ -205,6 +291,9 @@ def append_campaign_mappings_to_workbook(
         logger.warning("CombinedReportAgent: could not open workbook %s: %s", path, e)
         return
 
+    # Preserve any statuses already written from a previous (partial) run
+    existing_statuses = read_campaign_mapping_statuses(path)
+
     sheet_name = CAMPAIGN_MAPPINGS_SHEET[:31]
     if sheet_name in wb.sheetnames:
         del wb[sheet_name]
@@ -216,6 +305,7 @@ def append_campaign_mappings_to_workbook(
 
     for row_idx, m in enumerate(mappings, start=2):
         store_id = str(m.get("store_id", "")).strip()
+        store_name = str(m.get("store_name", "")).strip()
         min_subtotal = m.get("min_subtotal", 0)
         slot_tags = m.get("slot_tags") or []
         if isinstance(slot_tags, (list, tuple)):
@@ -223,10 +313,14 @@ def append_campaign_mappings_to_workbook(
         else:
             slot_tags_str = str(slot_tags).strip()
         campaign_name = str(m.get("campaign_name", "")).strip()
+        # Carry forward existing status so a rerun doesn't reset completed campaigns
+        status = existing_statuses.get(campaign_name, "Pending")
         ws.cell(row=row_idx, column=1, value=store_id)
-        ws.cell(row=row_idx, column=2, value=min_subtotal)
-        ws.cell(row=row_idx, column=3, value=slot_tags_str)
-        ws.cell(row=row_idx, column=4, value=campaign_name)
+        ws.cell(row=row_idx, column=2, value=store_name)
+        ws.cell(row=row_idx, column=3, value=min_subtotal)
+        ws.cell(row=row_idx, column=4, value=slot_tags_str)
+        ws.cell(row=row_idx, column=5, value=campaign_name)
+        ws.cell(row=row_idx, column=_COL_STATUS, value=status)
 
     try:
         wb.save(path)

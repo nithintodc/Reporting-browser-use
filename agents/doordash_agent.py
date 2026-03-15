@@ -7,112 +7,27 @@ Returns paths to downloaded report file(s) for use by analysis_agent and marketi
 import asyncio
 import logging
 import os
+import zipfile
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, Tuple
 
-from agents.combined_report_agent import append_campaign_mappings_to_workbook
+# Timeouts (seconds) for each browser-use agent phase
+AGENT_REPORTS_TIMEOUT = 900   # 15 min: login + create 2 reports + download both
+AGENT_LOGIN_TIMEOUT = 180     # 3 min: re-login after browser restart
+AGENT_RESET_TIMEOUT = 90      # 1.5 min: navigate to Marketing page between campaigns
+AGENT_CAMPAIGN_TIMEOUT = 360  # 6 min: create one campaign end-to-end
+
+# Campaigns per browser session before restart; override via env for tuning
+MAX_CAMPAIGNS_PER_SESSION = int(os.getenv("MAX_CAMPAIGNS_PER_SESSION", "5"))
+
+from agents.combined_report_agent import (
+    append_campaign_mappings_to_workbook,
+    read_campaign_mapping_statuses,
+    update_campaign_mapping_status,
+)
 from agents.slack_agent import push_to_slack
 
 logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# NOT IN MAIN FLOW — Full task: login + reports + download + single campaign
-# (Flow uses: login → reports → download → analysis → campaigns with subtotal+tags)
-# =============================================================================
-'''
-def get_task_description(
-    email: str,
-    password: str,
-    start_date: str,
-    end_date: str,
-    store_search: str,
-    store_name: str,
-    campaign_name: str,
-    min_subtotal: int = 10,
-    slot_tags: Optional[list] = None,
-) -> str:
-    """Build the agent task with credentials and date range."""
-    if not password:
-        raise ValueError("DOORDASH_PASSWORD is not set. Add it to your .env file (see .env.example).")
-    tags_list = [int(t) for t in (slot_tags or []) if t is not None and str(t).strip() != ""]
-    _tags_str = ", ".join(str(t) for t in sorted(tags_list)) if tags_list else ""
-    _sched_extra = f" In the schedule grid, check ONLY the cells that correspond to these tag numbers: {_tags_str}. Each cell has a tag (1–42)." if _tags_str else ""
-
-    return f"""
-You are automating the DoorDash Merchant Portal. Complete the following steps in order.
-Wait for the page to load after each action before proceeding. If a modal or overlay appears, interact with it as described.
-
-=== STEP 0: Navigate and log in (DO THIS EXACT ORDER — two-step login) ===
-The login has TWO steps. Do NOT enter the password in the email field. Do NOT click "Log In" until the password screen is visible.
-
-1. Go to exactly this URL: https://merchant-portal.doordash.com/merchant/login
-2. On the first screen you see: find the EMAIL input field (labeled "Email"). Enter ONLY the email address, exactly: {email}
-3. Click the "Continue to Log In" button (the red button). Wait for the page to change.
-4. On the NEXT screen (after Continue to Log In): find the PASSWORD input field. Enter ONLY the password there: {password}
-5. Click the "Log In" button. Wait until the dashboard or main merchant view has loaded (you should remain on merchant-portal.doordash.com).
-
-Important: The email field and password field appear on different steps. First screen = email + "Continue to Log In". Second screen = password + "Log In".
-
-=== STEP 1: Generate Financial Report ===
-5. On the dashboard, locate the LEFT SIDEBAR. Click on "Reports" in the sidebar.
-6. On the Reports page, find and click the "Create report" button (typically in the top right area).
-7. A modal will appear: "Choose a report type". Select the "Financial report" RADIO BUTTON (click it), then click "Next".
-8. Under "Choose a time range", select "By date range".
-9. Set Start date to: {start_date}
-10. Set End date to: {end_date}
-11. Click the "Create report" button at the bottom of the modal. Wait for the modal to close and the new report to appear in the reports list.
-
-=== STEP 2: Generate Marketing Report ===
-12. Click "Create report" again.
-13. In "Choose a report type", select the "Marketing report" RADIO BUTTON, then click "Next".
-14. Under "Channels": UNCHECK "Online Ordering". Leave "Marketplace" CHECKED.
-15. Under "Choose a time range", select "By date range".
-16. Set Start date to: {start_date} and End date to: {end_date}.
-17. Click "Create report" at the bottom. Wait for the report to appear in the list.
-18. Wait for the report to finish generating.
-
-=== STEP 3: Download the Financial Report ===
-18. On the Reports page, find the recently created "Financials" (or "Financial") report in the table/list.
-19. Find the DOWNLOAD icon (downward arrow) next to that specific report and click it to download the CSV. Wait for the download to complete if possible.
-
-=== STEP 4: Download the Marketing Report ===
-20. In the same Reports list, find the recently created "Marketing" report.
-21. Find the DOWNLOAD icon next to that report and click it to download. Wait for the download to complete if possible.
-
-=== STEP 5: Create a Marketing Campaign ===
-If you get stuck at any step below (modal does not open, action has no effect): in the LEFT SIDEBAR click "Marketing" then "Run a campaign" again, wait for the page to load, click "Customize your campaign" in the right panel, then continue from the step where you were stuck.
-22. In the LEFT SIDEBAR, click "Marketing", then "Run a campaign". Wait for the page to load. Do NOT click the red "Get started" button (that is for "Buy 1, get 1 free" at the top). Find the "Discount for all customers" card (in "Recommended for you") and click ONLY that card's "Select" button. A right side panel will appear; in that panel, click "Customize your campaign". Do not click any other buttons.
-
-23. Edit Stores:
-    - Find "Stores" and click the EDIT (pencil) icon next to it.
-    - Click "Select All" to clear all selected stores. Wait until all stores are unselected. NEVER search before clearing selections.
-    - THEN, in the search bar, type: {store_search}
-    - Select ONLY "{store_name}" from the results.
-    - Click "Save".
-
-24. Edit Customer incentive: In the right panel, scroll so "Customer incentive" is visible. Click the EDIT (pencil) that belongs to "Customer incentive" only. If the modal does not open, wait 3s, scroll to center "Customer incentive", click its Edit again. Then: Wait 2s. Click "15%" radio. Wait 2s. Under "Minimum subtotal" click "Custom". Wait 2s. Clear the text box. Wait 2s. Enter {min_subtotal}. Wait 4s. MANDATORY before Save: Under "Maximum discount amount" there are three buttons (e.g. $6, $8, $10). Click the LEFTMOST (smallest amount). Do NOT click Save until the smallest is selected. Wait 4s. Only then click "Save". Wait 2s.
-
-25. Edit Scheduling:
-    - Click the EDIT (pencil) icon next to "Scheduling".
-    - Choose "Set a custom schedule". A modal "Set custom schedule" will open with a grid of days and time slots (rows = slots, columns = days). Grid columns use day names from slots.csv: Mon, Tue, Wed, Thur, Fri, Sat, Sun.
-    - To clear all selections efficiently: click the "Weekdays" button at the top (this deselects Mon–Fri), then click the "Weekends" button (this deselects Sat–Sun). Do NOT click each day cell one by one.{_sched_extra}
-    
-    When selecting cells, always go LEFT TO RIGHT within each row, then the next row again left to right. Do NOT go column by column (top to bottom).
-    - Click "Save" at the bottom of the modal. Wait 2 seconds.
-
-26. Verify Customer incentive (Maximum discount amount): Open the "Customer incentive" module again (click the EDIT (pencil) next to "Customer incentive"). In the modal, set "Maximum discount amount" to the smallest value (click the LEFTMOST of the three buttons). Click "Save". This verifies the setting even if it was missed in step 24. Wait 2 seconds.
-
-27. Edit Campaign name:
-    - Click the EDIT (pencil) icon next to "Campaign name". Remove ALL existing text. Type exactly: {campaign_name}. Click "Save" inside the Campaign name module. Wait for confirmation that the name is saved.
-
-28. ONLY AFTER the campaign name is saved -> Click the "Create promotion" button at the bottom. NEVER click "Create promotion" before setting and saving the campaign name.
-
-=== DONE ===
-When all steps are complete, use the done action to finish. Summarize what was done: login, both reports created, both reports downloaded, and campaign "{campaign_name}" created.
-"""
-'''
-
 
 # --- IN USE: Login → Report creation → Report download (Phase 1 of main flow) ---
 def get_task_description_reports_only(
@@ -132,128 +47,62 @@ The login has TWO steps. Do NOT enter the password in the email field. Do NOT cl
 
 1. Go to exactly this URL: https://merchant-portal.doordash.com/merchant/login
 2. On the first screen: find the EMAIL input field (labeled "Email"). Enter ONLY the email, exactly: {email}
-3. Click the "Continue to Log In" button (the red button). Wait for the page to change.
+3. Click the "Continue to Log In" button (the red button). WAIT UNTIL the page changes and you see the password screen.
 4. On the NEXT screen: find the PASSWORD input field. Enter ONLY the password there: {password}
-5. Click the "Log In" button. Wait until the dashboard has loaded.
+5. Click the "Log In" button. WAIT UNTIL the dashboard has fully loaded (you see sidebar navigation and main content).
 
 === STEP 1: Generate Financial Report ===
-6. In the LEFT SIDEBAR, click "Reports". Click "Create report". Select "Financial report" RADIO BUTTON, click "Next".
-7. Choose "By date range". Set Start date: {start_date}, End date: {end_date}. Click "Create report". Wait for the report to appear in the list.
+6. In the LEFT SIDEBAR, click "Reports". WAIT UNTIL the Reports page loads. Click "Create report". Select "Financial report" RADIO BUTTON, click "Next".
+7. Choose "By date range". Set Start date: {start_date}, End date: {end_date}. Click "Create report". WAIT UNTIL the report appears in the list (it may take several seconds to generate).
 
-=== STEP 2: Generate Marketing Report ===
-8. Click "Create report". Select "Marketing report" RADIO BUTTON, click "Next". UNCHECK "Online Ordering", leave "Marketplace" CHECKED.
-9. By date range: Start {start_date}, End {end_date}. Click "Create report". Wait for it to appear.
+=== STEP 2: Download the Financial Report IMMEDIATELY ===
+8. The Financial report you just created should now be at the TOP of the reports list. Click the DOWNLOAD icon (arrow/download button) next to this TOPMOST "Financials" report row. WAIT UNTIL the download completes (file appears in downloads). Do NOT proceed until the financial report is fully downloaded.
 
-=== STEP 3: Download the Financial Report ===
-10. Find the recently created "Financials" (or "Financial") report. Click the DOWNLOAD icon next to it. Wait for the download to complete.
+=== STEP 3: Generate Marketing Report ===
+9. Click "Create report". Select "Marketing report" RADIO BUTTON, click "Next".
+10. IMPORTANT: You MUST UNCHECK "Online Ordering" checkbox. Make sure "Online Ordering" is UNCHECKED and "Marketplace" remains CHECKED.
+11. By date range: Start {start_date}, End {end_date}. Click "Create report". WAIT UNTIL the report appears in the list.
 
-=== STEP 4: Download the Marketing Report ===
-11. Find the recently created "Marketing" report. Click the DOWNLOAD icon next to it. Wait for the download to complete.
+=== STEP 4: Download the Marketing Report IMMEDIATELY ===
+12. The Marketing report you just created should now be at the TOP of the reports list. Click the DOWNLOAD icon (arrow/download button) next to this TOPMOST "Marketing" report row. WAIT UNTIL the download completes (file appears in downloads).
 
 === DONE (stop here — no campaign) ===
 When both reports are downloaded, use the done action to finish. Summarize: login, both reports created and downloaded.
 """
 
-
-# =============================================================================
-# NOT IN MAIN FLOW — Login + single campaign only (store_search, store_name, campaign_name)
-# =============================================================================
-'''
-def get_task_description_campaign_only(
-    email: str,
-    password: str,
-    store_search: str,
-    store_name: str,
-    campaign_name: str,
-    min_subtotal: int = 10,
-    slot_tags: Optional[list] = None,
-) -> str:
-    """Task that does login then only campaign creation (reports already done)."""
-    if not password:
-        raise ValueError("DOORDASH_PASSWORD is not set. Add it to your .env file (see .env.example).")
-    tags_list = [int(t) for t in (slot_tags or []) if t is not None and str(t).strip() != ""]
-    _tags_str = ", ".join(str(t) for t in sorted(tags_list)) if tags_list else ""
-    _sched_extra = f" In the schedule grid, check ONLY the cells that correspond to these tag numbers: {_tags_str}. Each cell has a tag (1–42). Grid columns use day names from slots.csv: Mon, Tue, Wed, Thur, Fri, Sat, Sun." if _tags_str else ""
-
+def _get_retry_download_task(missing_reports: list[str]) -> str:
+    """Generate a task to retry downloading missing reports from the already-open Reports page."""
+    parts = []
+    for report_type in missing_reports:
+        if report_type == "Financial":
+            parts.append(
+                '- Find the most recently created "Financials" (or "Financial") report row in the reports table. '
+                'Click the DOWNLOAD icon (arrow/download button) next to it. '
+                'WAIT UNTIL the download completes (file appears in downloads folder).'
+            )
+        elif report_type == "Marketing":
+            parts.append(
+                '- Find the most recently created "Marketing" report row in the reports table. '
+                'Click the DOWNLOAD icon (arrow/download button) next to it. '
+                'WAIT UNTIL the download completes (file appears in downloads folder).'
+            )
+    steps = "\n".join(parts)
     return f"""
-You are automating the DoorDash Merchant Portal. You are already done with reports; now only create the marketing campaign. Complete the following in order.
+You are on the DoorDash Merchant Portal. The Reports page should already be open.
+If you are not on the Reports page, click "Reports" in the left sidebar and WAIT for it to load.
 
-=== STEP 0: Log in (two-step login) ===
-1. Go to: https://merchant-portal.doordash.com/merchant/login
-2. Enter ONLY the email in the Email field: {email}. Click "Continue to Log In". Wait for the next screen.
-3. Enter ONLY the password in the Password field: {password}. Click "Log In". Wait for the dashboard.
+Download the following missing report(s):
+{steps}
 
-=== STEP 1: Create Marketing Campaign ===
-If you get stuck at any step below: in the LEFT SIDEBAR click "Marketing" then "Run a campaign" again, wait for the page, click "Customize your campaign" in the right panel, then continue from the step where you were stuck.
-4. In the LEFT SIDEBAR, click "Marketing", then "Run a campaign". Wait for the page. Do NOT click the red "Get started" button (for "Buy 1, get 1 free"). Find "Discount for all customers" (in "Recommended for you") and click ONLY that card's "Select". In the right side panel, click "Customize your campaign". Do not click any other buttons.
-
-5. Edit Stores: click EDIT (pencil) next to "Stores". Click "Select All" to clear. In the search bar type: {store_search}. Select ONLY "{store_name}". Click "Save".
-
-6. Set customer incentive: In the right panel, scroll so "Customer incentive" is visible. Click the Edit (pencil) next to "Customer incentive" only. If the modal does not open, wait 3s, scroll, click its Edit again. Wait 2s. Click "15%" radio. Under "Minimum subtotal" click "Custom". Wait 2s. Clear the text box. Wait 2s. Enter {min_subtotal}. Wait 4s. MANDATORY before Save: Under "Maximum discount amount" there are three buttons (e.g. $6, $8, $10). Click the LEFTMOST (smallest). Do NOT click Save until the smallest is selected. Wait 4s. Only then click "Save". Wait 2s.
-
-7. Edit Scheduling: click EDIT (pencil) next to "Scheduling". Choose "Set a custom schedule". Click "Weekdays" then "Weekends" to deselect all.{_sched_extra} In the grid (rows = slots, columns = days), always go LEFT TO RIGHT within each row, then next row left to right; do NOT go column by column. Click "Save". Wait 2 seconds.
-
-8. Verify Customer incentive (Maximum discount amount): Open "Customer incentive" again (click its EDIT (pencil)). In the modal, set "Maximum discount amount" to the smallest value (click the LEFTMOST of the three buttons). Click "Save". This verifies the setting even if it was missed earlier. Wait 2 seconds.
-
-9. Set campaign name: click EDIT (pencil) next to "Campaign name". Remove ALL existing text. Type exactly: {campaign_name}. Click "Save" inside the module. Wait for confirmation.
-
-10. ONLY AFTER the campaign name is saved -> click "Create promotion". Never click "Create promotion" before setting and saving the campaign name.
-
-=== DONE ===
-When the campaign is created, use the done action to finish. Summarize: login and campaign "{campaign_name}" created.
+IMPORTANT: Make sure to wait for each download to fully complete before proceeding to the next.
+When done, use the done action. Summarize which reports were downloaded.
 """
-'''
-
-
-# =============================================================================
-# NOT IN MAIN FLOW — Campaign when already logged in (single store, single campaign name)
-# =============================================================================
-'''
-def get_task_description_campaign_already_logged_in(
-    store_search: str,
-    store_name: str,
-    campaign_name: str,
-    min_subtotal: int = 10,
-    slot_tags: Optional[list] = None,
-) -> str:
-    """Task for campaign creation when already logged in (same browser session). No login steps."""
-    tags_list = [int(t) for t in (slot_tags or []) if t is not None and str(t).strip() != ""]
-    _tags_str = ", ".join(str(t) for t in sorted(tags_list)) if tags_list else ""
-    _sched_extra = f" In the schedule grid, check ONLY the cells that correspond to these tag numbers: {_tags_str}. Each cell has a tag (1–42). Grid columns use day names from slots.csv: Mon, Tue, Wed, Thur, Fri, Sat, Sun." if _tags_str else ""
-
-    return f"""
-CRITICAL — Scope: You are already logged in. Do NOT go to login or run reports. Perform ONLY the campaign steps below. Do NOT click any button not explicitly mentioned in this prompt.
-When clicking Edit (pencil): identify the correct one by section ("Customer incentive" vs "Stores" etc). If a click does not open the expected modal, scroll the right panel so that section is visible and click that section's Edit again — do not repeatedly click the same index. If you get stuck at any intermediate step (modal does not open, action has no effect): in the LEFT SIDEBAR click "Marketing" then "Run a campaign" again, wait for the page to load, click "Customize your campaign" in the right panel, then continue from the step where you were stuck. In "Set customer incentive": you MUST select the smallest "Maximum discount amount" (leftmost of the three buttons) before clicking Save.
-
-Create the marketing campaign: {campaign_name}
-
-1. Go to campaign selection: In the LEFT SIDEBAR, click "Marketing", then "Run a campaign". Wait for the page to load. Do NOT click the red "Get started" button (that is for "Buy 1, get 1 free" at the top — never click it). Find the "Discount for all customers" card (in "Recommended for you") and click ONLY that card's "Select" button. A right side panel will appear. In that panel, click "Customize your campaign". Do not click any other buttons.
-
-2. Edit Stores: click EDIT (pencil) next to "Stores". Click "Select All" to clear all selected stores. Wait until unselected. In the search bar type: {store_search}. Select ONLY "{store_name}". Click "Save".
-
-3. Set customer incentive: In the right panel, scroll so "Customer incentive" is visible. Click the Edit (pencil) next to "Customer incentive" only. If the modal does not open, wait 3s, scroll, click its Edit again. Wait 2s. Click "15%" radio. Under "Minimum subtotal" click "Custom". Wait 2s. Clear the text box. Wait 2s. Enter {min_subtotal}. Wait 4s. MANDATORY before Save: Under "Maximum discount amount" there are three buttons (e.g. $6, $8, $10). Click the LEFTMOST (smallest). Do NOT click Save until the smallest is selected. Wait 4s. Only then click "Save". Wait 2s.
-
-4. Edit Scheduling: click EDIT (pencil) next to "Scheduling". Choose "Set a custom schedule". In the modal: click "Weekdays" to deselect weekdays, "Weekends" to deselect weekends.{_sched_extra} In the grid (rows = slots, columns = days), go LEFT TO RIGHT within each row, then next row left to right; do NOT go column by column. Click "Save". Wait 2 seconds.
-
-5. Verify Customer incentive (Maximum discount amount): Open "Customer incentive" again (click its EDIT (pencil)). In the modal, set "Maximum discount amount" to the smallest value (click the LEFTMOST of the three buttons). Click "Save". This verifies the setting even if it was missed earlier. Wait 2 seconds.
-
-6. Set campaign name: click EDIT (pencil) next to "Campaign name". Remove ALL existing text. Type exactly: {campaign_name}. Click "Save" inside the Campaign name module. Wait for confirmation.
-
-7. Create promotion (only after step 6): ONLY AFTER the campaign name is saved, click "Create promotion". Never click "Create promotion" before setting and saving the campaign name.
-
-When the campaign is created, use the done action to finish. Summarize: campaign "{campaign_name}" created.
-"""
-'''
 
 
 # --- IN USE: Campaign creation with subtotal + slot tags (Phase 2, per store per subtotal) ---
 def get_task_description_campaign_for_subtotal_combo(combo: dict) -> str:
-    """
-    Build campaign task for one (store_id, min_subtotal, slot_tags) from slots.csv.
-    One campaign per minimum subtotal per store; selects ALL slot tags in the schedule grid.
-    Combo dict has: store_id, min_subtotal, slot_tags (list of int), campaign_name (e.g. TODC-{StoreID}-$15).
-    """
     store_id = str(combo.get("store_id", "")).strip()
+    store_name = str(combo.get("store_name", "")).strip()
     min_subtotal = combo.get("min_subtotal", 10)
     try:
         min_subtotal = int(round(float(min_subtotal)))
@@ -266,39 +115,152 @@ def get_task_description_campaign_for_subtotal_combo(combo: dict) -> str:
     campaign_name = str(combo.get("campaign_name", f"TODC-{store_id}-${min_subtotal}")).strip() or f"TODC-{store_id}-${min_subtotal}"
     tags_str = ", ".join(str(t) for t in sorted(slot_tags))
 
+    # Grid mapping: tag number → (row_name, col_name) for explicit instructions
+    ALL_TAGS = set(range(1, 43))
+    _GRID_ROWS = ["Early morning", "Breakfast", "Lunch", "Afternoon", "Dinner", "Late night"]
+    _GRID_COLS = ["Mon", "Tue", "Wed", "Thur", "Fri", "Sat", "Sun"]
+    def _tag_to_cell(t: int) -> str:
+        row_idx = (t - 1) // 7
+        col_idx = (t - 1) % 7
+        return f"{_GRID_ROWS[row_idx]}-{_GRID_COLS[col_idx]}"
+
+    selected_set = set(slot_tags)
+
+    def _group_by_row(tag_set):
+        """Group tags by row name for systematic processing."""
+        rows = {}
+        for t in sorted(tag_set):
+            row_idx = (t - 1) // 7
+            row_name = _GRID_ROWS[row_idx]
+            col_name = _GRID_COLS[(t - 1) % 7]
+            rows.setdefault(row_name, []).append((t, col_name))
+        return rows
+
+    # Always: deselect everything first, then select only the needed slots
+    grouped = _group_by_row(selected_set)
+    row_lines = []
+    for row_name, cells in grouped.items():
+        cols = ", ".join(f"{col} (tag {t})" for t, col in cells)
+        row_lines.append(f"  - {row_name} row ({len(cells)} cells): {cols}")
+    grouped_str = "\n".join(row_lines)
+    schedule_instructions = f"""- CRITICAL: Do NOT click any individual grid cells yet.
+- FIRST click "Weekdays" to DESELECT all weekday slots.
+- THEN click "Weekends" to DESELECT all weekend slots.
+- WAIT UNTIL all slots appear deselected (no checkmarks visible in any cell).
+- VERIFY: Every cell in the grid is empty before proceeding. If any cells still have checkmarks, click "Weekdays" and "Weekends" again to toggle them off.
+- Now SELECT (click to check) the following {len(selected_set)} cells, organized by row. Process ONE ROW AT A TIME:
+{grouped_str}
+- IMPORTANT: Click each cell exactly ONCE to select it. Do NOT click any cell more than once or it will toggle back off. Do NOT re-click cells you already selected.
+- After selecting all {len(selected_set)} cells above, verify that exactly {len(selected_set)} cells are checked.
+- COUNT the checked cells in each row to verify: {', '.join(f'{row}: {sum(1 for t in selected_set if (t-1)//7 == i)}' for i, row in enumerate(_GRID_ROWS) if sum(1 for t in selected_set if (t-1)//7 == i) > 0)}."""
+
     return f"""
-CRITICAL — Scope: You are already logged in to the DoorDash Merchant Portal. Do NOT go to the login page. Do NOT run reports or download anything. Perform ONLY the campaign creation steps below. Do NOT click any button that is not explicitly mentioned in this prompt.
-When clicking Edit (pencil) buttons: identify the correct one by the section it belongs to (e.g. "Customer incentive" vs "Stores"). If a click does not open the expected modal, scroll the right panel so that section is visible and click that section's Edit again — do not repeatedly click the same element index. If you get stuck at any intermediate step (modal does not open, action has no effect): in the LEFT SIDEBAR click "Marketing" then "Run a campaign" again, wait for the page to load, click "Customize your campaign" in the right panel, then continue from the step where you were stuck.
-In "Set customer incentive": you MUST select the smallest "Maximum discount amount" (the leftmost of the three buttons, e.g. $6) before clicking Save. Never save with middle or right button selected.
-In the schedule grid: always go LEFT TO RIGHT within each row, then the next row again left to right. Do NOT go column by column (top to bottom).
+ROLE: You are automating campaign creation on DoorDash Merchant Portal. You are already logged in.
 
-Create this campaign (one store, one minimum subtotal, multiple slots): {campaign_name}
+HARD RULES (read before every action):
+- Do NOT go to the login page.
+- Do NOT create reports or download anything.
+- Do NOT click "Get started" (that is for BOGO, not discount campaigns).
+- Do NOT click "Create promotion" until step 7 explicitly says to.
+- Do NOT click any button not mentioned in the steps below.
+- If a modal does not open after clicking Edit, wait 3 seconds, scroll to make the section visible, then click Edit again ONCE. If it still fails, go to sidebar > Marketing > Run a campaign and restart from step 1.
 
-1. Go to campaign selection: In the LEFT SIDEBAR, click "Marketing", then "Run a campaign". Wait for the page to load. Do NOT click the red "Get started" button (that is for "Buy 1, get 1 free" at the top — never click it). Find the "Discount for all customers" card (in the "Recommended for you" section) and click ONLY that card's "Select" button. A right side panel will appear. In that panel, click "Customize your campaign" to open the campaign setup form. Do not click any other buttons.
+CAMPAIGN: {campaign_name}
+STORE ID: {store_id}
+STORE NAME: {store_name if store_name else "N/A"}
+MIN SUBTOTAL: ${min_subtotal}
+SCHEDULE TAGS: {tags_str}
 
-2. Edit Stores: click EDIT (pencil) next to "Stores". Click "Select All" to clear all selected stores. Wait until all stores are unselected. NEVER search before clearing selections. In the search bar type: {store_id}. Select ONLY the store that contains "{store_id}" (e.g. McDonald's ({store_id} - ...)). Click "Save".
+STEP 1 — Open campaign builder:
+- Click "Marketing" in the left sidebar.
+- WAIT UNTIL the Marketing page has fully loaded (look for page content to appear, not just a spinner).
+- Click "Run a campaign".
+- WAIT UNTIL you see campaign type cards on the page. If after 10 seconds you don't see them, scroll down or click "Run a campaign" again.
+- VERIFY: You see campaign type cards on the page.
+- Find "Discount for all customers" card. Click its "Select" button.
+- WAIT UNTIL a right-side panel appears. VERIFY: A right-side panel is visible.
+- Click "Customize your campaign" in that panel.
+- WAIT UNTIL the campaign customization form loads.
 
-3. Set customer incentive — follow this order exactly, with waits:
-   - Opening the modal (critical): In the RIGHT side panel, scroll so the section labeled "Customer incentive" is fully visible. Click ONLY the Edit (pencil) that belongs to "Customer incentive" (next to that heading), NOT the Edit for Stores, Scheduling, or Campaign name. Identify by context: the correct pencil is in the same block as the text "Customer incentive". If the "Set customer incentive" modal does NOT open (you do not see "15%", "Minimum subtotal", "Custom"), wait 3 seconds, scroll the panel to bring "Customer incentive" into view, and click that section's Edit again once. Wait 2 seconds.
-   - Click the "15%" radio button (percentage discount). Wait 2 seconds.
-   - Under "Minimum subtotal", click the "Custom" button. Wait 2 seconds.
-   - Clear any value in the Custom minimum-subtotal text box. Wait 2 seconds.
-   - Enter {min_subtotal} in that text box. Wait 4 seconds.
-   - Maximum discount amount (MANDATORY — do this before Save): Find the section "Maximum discount amount". There are THREE buttons (e.g. $6, $8, $10). You MUST click the button with the SMALLEST dollar value (the LEFTMOST button). Do NOT click Save until the smallest amount is selected. If middle or right button is selected, click the LEFTMOST button to switch to the minimum. Wait 4 seconds after selecting it.
-   - Only after the above: click "Save" at the bottom of the modal. Wait 2 seconds.
+STEP 2 — Select store:
+- Click the Edit (pencil) icon next to "Stores".
+- WAIT UNTIL the Store selection modal is fully open and interactive.
+- VERIFY: Store selection modal is open. If not, wait a moment and click Edit again.
+- Click "Select All" to deselect all stores.
+- WAIT UNTIL all checkboxes are deselected.
+- Type "{store_id}" in the search bar.
+- WAIT UNTIL search results appear.
+- If a store matching "{store_id}" appears in the results, select it.
+- FALLBACK: If NO store appears for "{store_id}" (empty results or "no results found"), clear the search bar and type the store name "{store_name}" instead. WAIT UNTIL search results appear. Select the store matching "{store_name}".
+- Select ONLY one store (the one matching the Store ID or Store Name above).
+- Click "Save".
+- WAIT UNTIL the modal closes and the store selection is saved.
 
-4. Edit Scheduling: click EDIT (pencil) next to "Scheduling". Choose "Set a custom schedule". In the modal:
-   - Click the "Weekdays" button to deselect all weekday slots. Click the "Weekends" button to deselect all weekend slots.
-   - In the schedule grid, check ALL cells that correspond to these tag numbers: {tags_str}. Each cell in the grid has a tag number (1–42). Check every cell whose tag is in this list; leave all other cells unchecked. Grid columns use day names from slots.csv (columns 2–8): Mon, Tue, Wed, Thur, Fri, Sat, Sun. CRITICAL — When selecting cells, always go LEFT TO RIGHT within each row, then move to the next row and again left to right. Do NOT go column by column (top to bottom). Rows = time slots (e.g. Early morning, Breakfast). Traverse row by row: first row left→right, then second row left→right, and so on.
-   - Click "Save". Wait 2 seconds.
+STEP 3 — Set customer incentive:
+- Scroll the right panel until "Customer incentive" heading is visible.
+- Click the Edit (pencil) icon that is DIRECTLY next to "Customer incentive" text.
+- WAIT UNTIL the incentive modal is fully loaded.
+- VERIFY: Modal title says "Set customer incentive". If not, do NOT proceed — wait 3 seconds, then retry the click once. If still wrong, navigate to sidebar > Marketing > Run a campaign and restart from step 1.
+- Click "15%" radio button.
+- WAIT UNTIL the radio button is selected.
+- Click "Custom" under Minimum subtotal.
+- WAIT UNTIL the custom subtotal input field appears.
+- Click DIRECTLY on the custom subtotal INPUT FIELD (not the "Custom" button) to focus it.
+- Select all text in the field (triple-click or Ctrl+A / Cmd+A).
+- Type: {min_subtotal}
+- WAIT 2 seconds for the field to update.
+- VERIFY the field now displays "{min_subtotal}" or "${min_subtotal}". READ the actual value shown in the input field.
+- If the field is EMPTY or shows a DIFFERENT value (like "$25" which is the default), you MUST fix it:
+  1. Click the input field again to focus it.
+  2. Triple-click to select all existing text.
+  3. Type {min_subtotal} again.
+  4. WAIT 2 seconds and re-verify.
+- Do NOT proceed until the field shows {min_subtotal} or ${min_subtotal}. The default value of $25 is WRONG unless the target is exactly $25.
+- Find "Maximum discount amount" section (three buttons like $5, $7, $10 or similar).
+- Click the LEFTMOST button (smallest value, typically $5 or $2).
+- VERIFY: The leftmost button appears selected/highlighted.
+- Click "Save".
+- WAIT UNTIL the modal closes.
 
-5. Verify Customer incentive (Maximum discount amount): Open the "Customer incentive" module again (click the EDIT (pencil) next to "Customer incentive"). In the modal, set "Maximum discount amount" to the smallest value (click the LEFTMOST of the three buttons). Click "Save". This verifies the setting even if it was missed in step 3. Wait 2 seconds.
+STEP 4 — Set schedule:
+- Click the Edit (pencil) icon next to "Scheduling".
+- WAIT UNTIL the Scheduling modal is fully open with a grid visible.
+- VERIFY: Scheduling modal is open with a grid. If not, wait and retry.
+- Click "Set a custom schedule".
+- WAIT UNTIL the custom schedule grid is visible.
+- Grid layout: 6 rows (Early morning, Breakfast, Lunch, Afternoon, Dinner, Late night) x 7 columns (Mon, Tue, Wed, Thur, Fri, Sat, Sun).
+{schedule_instructions}
+- Click "Save".
+- WAIT UNTIL the modal closes and the schedule is saved.
 
-6. Set campaign name: click the EDIT (pencil) next to "Campaign name". Remove ALL existing text in the field. Type exactly: {campaign_name}. Click "Save" inside the Campaign name module. Wait for confirmation that the name is saved.
+STEP 5 — Verify incentive (MANDATORY safety check):
+- Click Edit (pencil) next to "Customer incentive" again.
+- WAIT UNTIL the modal opens.
+- READ the current Minimum subtotal value displayed in the field. It MUST show {min_subtotal} or ${min_subtotal}.
+- If it shows $25 (the default) or ANY value other than ${min_subtotal}, it is WRONG and you MUST fix it:
+  1. Click "Custom" under Minimum subtotal.
+  2. Click the input field to focus it.
+  3. Triple-click to select all text, then type: {min_subtotal}
+  4. WAIT 2 seconds and verify the field shows {min_subtotal} or ${min_subtotal}.
+- Confirm the leftmost Maximum discount button is selected. If not, click it.
+- Click "Save".
+- WAIT UNTIL the modal closes.
+- VERIFY: The campaign summary/panel should show "orders ${min_subtotal} or more" (NOT $25 unless target is $25). If it shows the wrong value, go back to STEP 5 and fix it.
 
-7. Create promotion (only after step 6 is done): ONLY AFTER the campaign name is saved, click the "Create promotion" button at the bottom. Never click "Create promotion" before setting and saving the campaign name.
+STEP 6 — Set campaign name:
+- Click Edit (pencil) next to "Campaign name".
+- WAIT UNTIL the name editing field is visible and editable.
+- Clear ALL existing text in the name field.
+- Type exactly: {campaign_name}
+- Click "Save".
+- WAIT UNTIL the modal closes.
+- VERIFY: The campaign name shows as "{campaign_name}".
 
-When the campaign is created, use the done action to finish. Summarize: campaign "{campaign_name}" created.
+STEP 7 — Create the promotion:
+- ONLY now click "Create promotion" at the bottom.
+- WAIT UNTIL you see confirmation that the campaign was created (a success message, toast, or redirect).
+
+DONE: Use the done action. Summarize: campaign "{campaign_name}" created for store {store_id}.
 """
 
 
@@ -335,16 +297,36 @@ def _get_browser(download_dir: Path, keep_alive: bool = False):
     return Browser(**common)
 
 
+def _peek_zip_type(path: Path) -> str:
+    """
+    Inspect ZIP contents to classify as 'financial', 'marketing', or ''.
+    Used as fallback when filename has no recognizable keyword.
+    """
+    try:
+        with zipfile.ZipFile(path, "r") as z:
+            names_upper = " ".join(z.namelist()).upper()
+        if "FINANCIAL_DETAILED" in names_upper or ("FINANCIAL" in names_upper and "MARKETING" not in names_upper):
+            return "financial"
+        if "MARKETING_PROMOTION" in names_upper or "MARKETING_SPONSORED" in names_upper or "MARKETING" in names_upper:
+            return "marketing"
+    except Exception:
+        pass
+    return ""
+
+
 def _discover_downloads(download_dir: Path) -> Tuple[Optional[Path], Optional[Path]]:
     """
     Find the most recent financial and marketing report files in download_dir.
-    Returns (marketing_path, financial_path). Financial is typically ZIP or CSV; marketing often ZIP.
+    Strategy:
+      1. Filename keyword match ("financial", "marketing").
+      2. If keywords fail, peek inside ZIPs to classify by content.
+      3. Last resort: treat the most-recent file as financial.
+    Returns (marketing_path, financial_path).
     """
     download_dir = Path(download_dir)
     if not download_dir.is_dir():
         return (None, None)
 
-    # Sort by mtime descending; accept .csv, .zip
     all_files = []
     for ext in ("*.csv", "*.zip", "*.xlsx"):
         for f in download_dir.glob(ext):
@@ -355,6 +337,8 @@ def _discover_downloads(download_dir: Path) -> Tuple[Optional[Path], Optional[Pa
     financial_path: Optional[Path] = None
     marketing_path: Optional[Path] = None
 
+    # Pass 1: filename keywords (fast)
+    unmatched = []
     for _mtime, path in all_files:
         name_lower = path.name.lower()
         if "financial" in name_lower or "financials" in name_lower:
@@ -363,123 +347,85 @@ def _discover_downloads(download_dir: Path) -> Tuple[Optional[Path], Optional[Pa
         elif "marketing" in name_lower:
             if marketing_path is None:
                 marketing_path = path
+        else:
+            unmatched.append(path)
         if financial_path and marketing_path:
             break
 
-    # If we only have one file, assume financial (task downloads financial first, then marketing)
-    if len(all_files) >= 1 and financial_path is None and marketing_path is None:
-        financial_path = all_files[0][1]
+    # Pass 2: ZIP content inspection for files not matched by name
+    if (financial_path is None or marketing_path is None) and unmatched:
+        for path in unmatched:
+            if path.suffix.lower() == ".zip":
+                kind = _peek_zip_type(path)
+                if kind == "financial" and financial_path is None:
+                    financial_path = path
+                    logger.info("DoorDash: classified %s as financial by content", path.name)
+                elif kind == "marketing" and marketing_path is None:
+                    marketing_path = path
+                    logger.info("DoorDash: classified %s as marketing by content", path.name)
+            if financial_path and marketing_path:
+                break
+
+    # Pass 3: last resort — treat most-recent unmatched file as financial
+    # but never reuse a file already assigned to marketing_path
+    if financial_path is None and all_files:
+        for _mtime, candidate in all_files:
+            if candidate != marketing_path:
+                financial_path = candidate
+                logger.warning("DoorDash: no filename/content match; treating %s as financial", financial_path.name)
+                break
+        if financial_path is None:
+            logger.warning("DoorDash: only one file found and it is already assigned as marketing; no financial report available")
 
     return (marketing_path, financial_path)
 
 
-async def _run_agent(download_dir: Path, task: str) -> None:
-    """Run the browser-use agent with the given task (no download discovery)."""
+async def _kill_browser(browser) -> None:
+    """Gracefully kill/close browser; swallows all errors."""
+    try:
+        kill_fn = getattr(browser, "kill", None) or getattr(browser, "close", None)
+        if callable(kill_fn):
+            result = kill_fn()
+            if asyncio.iscoroutine(result):
+                await result
+    except Exception as e:
+        logger.debug("Browser close: %s", e)
+
+
+async def run_reports_only(
+    download_dir: Path,
+    email: str,
+    password: str,
+    start_date: str,
+    end_date: str,
+) -> Tuple[Optional[Path], Optional[Path]]:
+    """
+    Run only login + report creation + download. Stops before campaign.
+    Returns (marketing_download_path, financial_download_path) for analysis agents.
+    """
     from browser_use import Agent
 
     download_dir = Path(download_dir)
     download_dir.mkdir(parents=True, exist_ok=True)
+    task = get_task_description_reports_only(
+        email=email,
+        password=password,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    logger.info("DoorDash (browser-use): Starting reports-only run (login, reports, download)")
     llm = _get_llm()
     browser = _get_browser(download_dir)
     agent = Agent(task=task, llm=llm, browser=browser)
-    history = await agent.run()
+    history = await asyncio.wait_for(agent.run(), timeout=AGENT_REPORTS_TIMEOUT)
     if history and history.final_result:
         logger.info("DoorDash (browser-use): %s", history.final_result)
-    else:
-        logger.info("DoorDash (browser-use): Run completed.")
-
-
-async def run_reports_only(
-    download_dir: Path,
-    email: str,
-    password: str,
-    start_date: str,
-    end_date: str,
-) -> Tuple[Optional[Path], Optional[Path]]:
-    """
-    Run only login + report creation + download. Stops before campaign.
-    Returns (marketing_download_path, financial_download_path) for analysis agents.
-    """
-    download_dir = Path(download_dir)
-    task = get_task_description_reports_only(
-        email=email,
-        password=password,
-        start_date=start_date,
-        end_date=end_date,
-    )
-    logger.info("DoorDash (browser-use): Starting reports-only run (login, reports, download)")
-    await _run_agent(download_dir, task)
     marketing_path, financial_path = _discover_downloads(download_dir)
     if financial_path:
         logger.info("DoorDash (browser-use): Financial report at %s", financial_path)
     if marketing_path:
         logger.info("DoorDash (browser-use): Marketing report at %s", marketing_path)
     return (marketing_path, financial_path)
-
-
-# =============================================================================
-# NOT IN MAIN FLOW — Standalone: login + report creation + download only
-# =============================================================================
-'''
-async def run_reports_only(
-    download_dir: Path,
-    email: str,
-    password: str,
-    start_date: str,
-    end_date: str,
-) -> Tuple[Optional[Path], Optional[Path]]:
-    """
-    Run only login + report creation + download. Stops before campaign.
-    Returns (marketing_download_path, financial_download_path) for analysis agents.
-    """
-    download_dir = Path(download_dir)
-    task = get_task_description_reports_only(
-        email=email,
-        password=password,
-        start_date=start_date,
-        end_date=end_date,
-    )
-    logger.info("DoorDash (browser-use): Starting reports-only run (login, reports, download)")
-    await _run_agent(download_dir, task)
-    marketing_path, financial_path = _discover_downloads(download_dir)
-    if financial_path:
-        logger.info("DoorDash (browser-use): Financial report at %s", financial_path)
-    if marketing_path:
-        logger.info("DoorDash (browser-use): Marketing report at %s", marketing_path)
-    return (marketing_path, financial_path)
-'''
-
-
-# =============================================================================
-# NOT IN MAIN FLOW — Standalone: login + single campaign only
-# =============================================================================
-'''
-async def run_campaign_only(
-    download_dir: Path,
-    email: str,
-    password: str,
-    store_search: str,
-    store_name: str,
-    campaign_name: str,
-    min_subtotal: int = 10,
-    slot_tags: Optional[list] = None,
-) -> None:
-    """
-    Run only login + campaign creation. Use after reports are downloaded and analysis/combined report have run.
-    """
-    download_dir = Path(download_dir)
-    task = get_task_description_campaign_only(
-        email=email,
-        password=password,
-        store_search=store_search,
-        store_name=store_name,
-        campaign_name=campaign_name,
-        min_subtotal=min_subtotal,
-        slot_tags=slot_tags,
-    )
-    logger.info("DoorDash (browser-use): Starting campaign-only run")
-    await _run_agent(download_dir, task)
-'''
 
 
 # --- IN USE: Main flow — Login → Reports → Download → Analysis → Campaigns (subtotal+tags) for all stores/subtotals ---
@@ -531,24 +477,49 @@ async def run_reports_then_analysis_then_campaign(
 
     logger.info("DoorDash (browser-use): Phase 1 — reports (login, create, download); browser will stay open.")
     try:
-        await agent.run()
+        await asyncio.wait_for(agent.run(), timeout=AGENT_REPORTS_TIMEOUT)
         push_to_slack(f"Login successful for {email}")
+    except asyncio.TimeoutError:
+        await _kill_browser(browser)
+        push_to_slack(f"Phase 1 timed out after {AGENT_REPORTS_TIMEOUT}s for {email}")
+        raise RuntimeError(f"Phase 1 (reports) timed out after {AGENT_REPORTS_TIMEOUT}s")
     except Exception as e:
+        await _kill_browser(browser)
         push_to_slack(f"Login failed for {email}: {e}")
         raise e
 
     marketing_path, financial_path = _discover_downloads(download_dir)
+
+    # --- Retry: if one report is missing, attempt to download just the missing one ---
+    if not financial_path or not marketing_path:
+        missing = []
+        if not financial_path:
+            missing.append("Financial")
+        if not marketing_path:
+            missing.append("Marketing")
+        logger.warning("DoorDash (browser-use): Missing report(s) after Phase 1: %s. Retrying download.", ", ".join(missing))
+        push_to_slack(f"Missing report(s): {', '.join(missing)}. Retrying download...")
+
+        retry_task = _get_retry_download_task(missing)
+        retry_agent = Agent(task=retry_task, llm=llm, browser=browser)
+        try:
+            await asyncio.wait_for(retry_agent.run(), timeout=300)  # 5 min retry
+            marketing_path, financial_path = _discover_downloads(download_dir)
+            logger.info("DoorDash (browser-use): After retry — financial=%s, marketing=%s", financial_path, marketing_path)
+        except Exception as retry_err:
+            logger.warning("DoorDash (browser-use): Retry download failed: %s", retry_err)
+
     if financial_path:
         logger.info("DoorDash (browser-use): Financial report at %s", financial_path)
         push_to_slack("Financials Report pulled")
     else:
-        push_to_slack("Financials Report failed: file not found")
-        
+        push_to_slack("Financials Report failed: file not found after retry")
+
     if marketing_path:
         logger.info("DoorDash (browser-use): Marketing report at %s", marketing_path)
         push_to_slack("Marketing report pulled")
     else:
-        push_to_slack("Marketing report failed: file not found")
+        push_to_slack("Marketing report failed: file not found after retry")
 
     if financial_path and marketing_path:
         push_to_slack("Reports downloaded")
@@ -584,118 +555,162 @@ async def run_reports_then_analysis_then_campaign(
                 slot_tags = [f"{c.get('day', '')}-{c.get('slot', '')}"]
             mappings.append({
                 "store_id": c.get("store_id", ""),
+                "store_name": c.get("store_name", ""),
                 "min_subtotal": c.get("min_subtotal", 10),
                 "slot_tags": slot_tags or [],
                 "campaign_name": c.get("campaign_name", ""),
             })
         append_campaign_mappings_to_workbook(Path(combined_path), mappings)
 
-    if hasattr(agent, "add_new_task"):
-        if combos:
-            if ensure_campaigns_executed_csv:
-                ensure_campaigns_executed_csv(download_dir)
+        # Skip campaigns already marked Successful in the sheet (resume after partial run)
+        existing_statuses = read_campaign_mapping_statuses(Path(combined_path))
+        already_done = {name for name, s in existing_statuses.items() if s == "Successful"}
+        if already_done:
+            before = len(combos)
+            combos = [c for c in combos if c.get("campaign_name") not in already_done]
             logger.info(
-                "DoorDash (browser-use): Phase 2 — %s campaigns from %s (same session).",
-                len(combos),
-                "slots.csv" if use_slots_csv else "combined_analysis",
+                "DoorDash: skipping %d already-Successful campaign(s); %d remaining.",
+                before - len(combos), len(combos),
             )
-            for i, combo in enumerate(combos, 1):
-                task = get_task_description_campaign_for_subtotal_combo(combo)
-                agent.add_new_task(task)
-                
-                campaign_name = str(combo.get("campaign_name", ""))
-                store_id = str(combo.get("store_id", ""))
-                min_subtotal = str(combo.get("min_subtotal", "10"))
-                # Support both per-slot (day, slot) and subtotal-based (slot_tags) campaign systems
-                if combo.get("day") and combo.get("slot"):
-                    detail = f"store {store_id}, {combo.get('day')}, {combo.get('slot')}, min_subtotal ${min_subtotal}"
-                else:
-                    detail = f"store {store_id}, min_subtotal ${min_subtotal}"
-                push_to_slack(f"{campaign_name} setup in progress — {detail}")
-                
+            push_to_slack(f"Resuming: {before - len(combos)} campaigns already done, {len(combos)} remaining")
+
+    # Template for re-login after browser restart
+    relogin_task = (
+        f"Go to https://merchant-portal.doordash.com/merchant/login\n"
+        f"Enter email: {email}, click 'Continue to Log In'.\n"
+        f"On the next screen, enter password: {password}, click 'Log In'.\n"
+        f"Wait for the dashboard to load. Use done action to finish."
+    )
+
+    # Navigation reset run before each campaign to dismiss any leftover UI and land on Marketing page
+    reset_task = (
+        "IMPORTANT: Before navigating, check if any modal, popup, dialog, or overlay is currently visible on the page. "
+        "If so, close it by clicking 'X', 'Close', 'Cancel', or pressing Escape. "
+        "Then navigate to the DoorDash Merchant Portal dashboard. "
+        "In the LEFT SIDEBAR, click 'Marketing'. "
+        "WAIT UNTIL the Marketing page has fully loaded (you see campaign-related content, not a loading spinner). "
+        "If the page shows an error or doesn't load, try clicking 'Marketing' in the sidebar again. "
+        "Confirm you see the Marketing page. Use the done action to finish."
+    )
+
+    if combos:
+        if ensure_campaigns_executed_csv:
+            ensure_campaigns_executed_csv(download_dir)
+        logger.info(
+            "DoorDash (browser-use): Phase 2 — %s campaigns from %s (fresh Agent context per campaign).",
+            len(combos),
+            "slots.csv" if use_slots_csv else "combined_analysis",
+        )
+        for i, combo in enumerate(combos, 1):
+            # Restart browser every N campaigns to prevent browser memory growth
+            if i > 1 and (i - 1) % MAX_CAMPAIGNS_PER_SESSION == 0:
+                logger.info("Restarting browser after %d campaigns to prevent memory growth", i - 1)
+                await _kill_browser(browser)
+                browser = _get_browser(download_dir, keep_alive=True)
+                relogin_ok = False
+                for relogin_attempt in range(1, 3):  # 2 attempts to re-login
+                    try:
+                        login_agent = Agent(task=relogin_task, llm=llm, browser=browser)
+                        await asyncio.wait_for(login_agent.run(), timeout=AGENT_LOGIN_TIMEOUT)
+                        push_to_slack(f"Browser restarted after {i - 1} campaigns, re-logged in")
+                        relogin_ok = True
+                        break
+                    except asyncio.TimeoutError:
+                        logger.warning("Re-login attempt %d timed out", relogin_attempt)
+                        await _kill_browser(browser)
+                        browser = _get_browser(download_dir, keep_alive=True)
+                    except Exception as e:
+                        logger.warning("Re-login attempt %d failed: %s", relogin_attempt, e)
+                        await _kill_browser(browser)
+                        browser = _get_browser(download_dir, keep_alive=True)
+                if not relogin_ok:
+                    push_to_slack(f"Re-login failed after browser restart at campaign {i}; aborting remaining campaigns")
+                    logger.error("Re-login failed after 2 attempts; stopping campaign loop to avoid running on dead browser")
+                    await _kill_browser(browser)
+                    return
+
+            # Fresh Agent for navigation reset — clean LLM context, same browser session
+            # Navigate to a fresh URL first to clear any stale DOM/JS state from previous campaign
+            nav_to_marketing_task = (
+                "Go to this URL: https://merchant-portal.doordash.com/merchant/marketing "
+                "WAIT UNTIL the page has fully loaded. "
+                "If any modal, popup, dialog, or overlay is visible, close it by clicking 'X', 'Close', 'Cancel', or pressing Escape. "
+                "Confirm you see the Marketing page with campaign-related content. Use the done action to finish."
+            )
+            try:
+                reset_agent = Agent(task=nav_to_marketing_task, llm=llm, browser=browser)
+                await asyncio.wait_for(reset_agent.run(), timeout=AGENT_RESET_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("Navigation reset timed out before campaign %s; attempting fallback reset", i)
+                # Fallback: try the sidebar-click method
                 try:
-                    history = await agent.run()
-                    # When browser-use hits max_failures it stops without raising; treat as failed if not clearly successful
-                    completed_ok = True
-                    if history is not None:
-                        if hasattr(history, "is_successful") and callable(history.is_successful):
-                            completed_ok = history.is_successful()
-                        elif hasattr(history, "final_result"):
-                            val = history.final_result
-                            completed_ok = val is not None and (val() if callable(val) else val)
-                    if completed_ok:
-                        status = "Completed"
-                        push_to_slack(f"{campaign_name} — done")
-                    else:
-                        status = "Failed"
-                        push_to_slack(f"{campaign_name} — failed (agent stopped without completing)")
-                        logger.warning(
-                            "Campaign %s: agent run stopped (e.g. consecutive failures) without completing.",
-                            combo.get("campaign_name"),
-                        )
-                except Exception as e:
-                    logger.warning("Campaign %s failed: %s", combo.get("campaign_name"), e)
+                    fallback_agent = Agent(task=reset_task, llm=llm, browser=browser)
+                    await asyncio.wait_for(fallback_agent.run(), timeout=AGENT_RESET_TIMEOUT)
+                except Exception:
+                    logger.warning("Fallback navigation reset also failed before campaign %s", i)
+            except Exception as e:
+                logger.warning("Navigation reset failed before campaign %s: %s; continuing", i, e)
+
+            campaign_name = str(combo.get("campaign_name", ""))
+            store_id = str(combo.get("store_id", ""))
+            min_subtotal = str(combo.get("min_subtotal", "10"))
+            if combo.get("day") and combo.get("slot"):
+                detail = f"store {store_id}, {combo.get('day')}, {combo.get('slot')}, min_subtotal ${min_subtotal}"
+            else:
+                detail = f"store {store_id}, min_subtotal ${min_subtotal}"
+            push_to_slack(f"{campaign_name} setup in progress — {detail}")
+
+            # Fresh Agent per campaign — LLM context never carries previous campaign history
+            campaign_task = get_task_description_campaign_for_subtotal_combo(combo)
+            status = "Failed"
+            try:
+                campaign_agent = Agent(task=campaign_task, llm=llm, browser=browser)
+                history = await asyncio.wait_for(campaign_agent.run(), timeout=AGENT_CAMPAIGN_TIMEOUT)
+                completed_ok = True
+                if history is not None:
+                    if hasattr(history, "is_successful") and callable(history.is_successful):
+                        completed_ok = history.is_successful()
+                    elif hasattr(history, "final_result"):
+                        val = history.final_result
+                        completed_ok = bool(val() if callable(val) else val) if val is not None else False
+                if completed_ok:
+                    status = "Successful"
+                    push_to_slack(f"{campaign_name} — done")
+                else:
                     status = "Failed"
-                    push_to_slack(f"{campaign_name} — failed: {e}")
-                if log_campaign_executed:
-                    log_campaign_executed(
-                        download_dir,
-                        store_id=str(combo.get("store_id", "")),
-                        campaign_name=str(combo.get("campaign_name", "")),
-                        pct_value=15,
-                        min_subtotal=float(combo.get("min_subtotal", 10)),
-                        max_discount="Always lowest",
-                        status=status,
-                    )
-                logger.info("DoorDash (browser-use): Campaign %s/%s done: %s", i, len(combos), combo.get("campaign_name"))
-        else:
-            logger.warning(
-                "DoorDash (browser-use): No campaign combos from combined_analysis. Store IDs come only from that file (Day-Slot - {StoreID} sheets). Skip campaigns until combined_analysis is created for this account."
-            )
+                    push_to_slack(f"{campaign_name} — failed (agent stopped without completing)")
+                    logger.warning("Campaign %s: agent stopped without completing", campaign_name)
+            except asyncio.TimeoutError:
+                status = "Failed"
+                logger.warning("Campaign %s timed out after %ss", campaign_name, AGENT_CAMPAIGN_TIMEOUT)
+                push_to_slack(f"{campaign_name} — timed out")
+            except Exception as e:
+                status = "Failed"
+                logger.warning("Campaign %s failed: %s", campaign_name, e)
+                push_to_slack(f"{campaign_name} — failed: {e}")
+
+            # Write status live to Campaign Mappings sheet so reruns can skip Successful ones
+            if combined_path and Path(combined_path).is_file():
+                update_campaign_mapping_status(Path(combined_path), campaign_name, status)
+
+            if log_campaign_executed:
+                log_campaign_executed(
+                    download_dir,
+                    store_id=store_id,
+                    campaign_name=campaign_name,
+                    pct_value=15,
+                    min_subtotal=float(combo.get("min_subtotal", 10)),
+                    max_discount="Always lowest",
+                    status=status,
+                )
+            logger.info("DoorDash (browser-use): Campaign %s/%s done: %s [%s]", i, len(combos), campaign_name, status)
+            # Brief yield to let the event loop breathe; not a hard wait
+            await asyncio.sleep(1)
+
     else:
         logger.warning(
-            "Agent.add_new_task not found. Store IDs come only from combined_analysis; cannot run campaigns without chaining. Skip campaign phase."
+            "DoorDash (browser-use): No campaign combos from combined_analysis. "
+            "Store IDs come from Day-Slot - {StoreID} sheets. Skip campaigns until combined_analysis is created."
         )
 
-    try:
-        kill_fn = getattr(browser, "kill", None)
-        if callable(kill_fn):
-            result = kill_fn()
-            if asyncio.iscoroutine(result):
-                await result
-        else:
-            close_fn = getattr(browser, "close", None)
-            if callable(close_fn):
-                result = close_fn()
-                if asyncio.iscoroutine(result):
-                    await result
-    except Exception as e:
-        logger.debug("Browser close/kill: %s", e)
-
-
-# =============================================================================
-# NOT IN MAIN FLOW — Convenience: reports-only (main flow is run_reports_then_analysis_then_campaign)
-# =============================================================================
-'''
-async def run(
-    download_dir: Path,
-    email: str,
-    password: str,
-    start_date: str,
-    end_date: str,
-    store_search: str = "",
-    store_name: str = "",
-    campaign_name: str = "",
-) -> Tuple[Optional[Path], Optional[Path]]:
-    """
-    Run reports-only then return paths (convenience alias for run_reports_only).
-    For full flow with analysis in between, use run_reports_then_analysis_then_campaign.
-    """
-    return await run_reports_only(
-        download_dir=download_dir,
-        email=email,
-        password=password,
-        start_date=start_date,
-        end_date=end_date,
-    )
-'''
+    await _kill_browser(browser)

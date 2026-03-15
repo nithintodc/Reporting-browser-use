@@ -27,6 +27,7 @@ load_dotenv()
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 DOWNLOADS_ROOT = Path(__file__).resolve().parent / "downloads"
+LOGS_DIR = Path(__file__).resolve().parent / "logs"
 
 
 def _run_dir_for_email(email: str) -> Path:
@@ -38,20 +39,45 @@ def _run_dir_for_email(email: str) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return DOWNLOADS_ROOT / f"{safe}-{timestamp}"
 
-# Retry configuration
+# Retry configuration — base delay doubles each attempt: 5s, 10s, 20s, ...
 MAX_RETRIES = 3
-RETRY_DELAY_SEC = 5
+RETRY_BASE_DELAY_SEC = 5
 
 
-def setup_logging(level: int = logging.INFO) -> None:
-    """Configure structured logging to stderr."""
-    logging.basicConfig(
-        level=level,
-        format=LOG_FORMAT,
-        datefmt=LOG_DATE_FORMAT,
-        stream=sys.stderr,
-        force=True,
-    )
+def setup_logging(level: int = logging.INFO) -> logging.FileHandler:
+    """Configure structured logging to stderr AND a timestamped log file in logs/."""
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = LOGS_DIR / f"run_{timestamp}.log"
+
+    # File handler — captures everything (DEBUG and above)
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT))
+
+    # Console handler — INFO and above (same as before)
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setLevel(level)
+    console_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT))
+
+    # Configure root logger with both handlers
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    root.handlers.clear()
+    root.addHandler(console_handler)
+    root.addHandler(file_handler)
+
+    # Also create/update a symlink for easy access: logs/latest.log -> run_XXXX.log
+    latest_link = LOGS_DIR / "latest.log"
+    try:
+        if latest_link.is_symlink() or latest_link.exists():
+            latest_link.unlink()
+        latest_link.symlink_to(log_file.name)
+    except OSError:
+        pass  # symlinks may not work on all systems
+
+    logging.info("Log file: %s", log_file)
+    return file_handler
 
 
 def get_required_env(name: str) -> str:
@@ -89,6 +115,49 @@ def get_last_three_months_date_range():
     return start_str, end_str
 
 
+def _run_marketing(marketing_path: Path, run_dir: Path, report_start_date: str, report_end_date: str, operator_name: str):
+    """Blocking marketing analysis — intended to be run via asyncio.to_thread."""
+    try:
+        result = marketing_run(
+            marketing_path,
+            output_dir=run_dir,
+            post_start_date=report_start_date,
+            post_end_date=report_end_date,
+            operator_name=operator_name,
+            write_file=False,
+        )
+        return result if isinstance(result, list) else None
+    except Exception as e:
+        logging.getLogger("main").warning("MarketingAgent failed (non-fatal): %s", e)
+        return None
+
+
+def _run_financial(financial_path: Path, run_dir: Path, report_start_date: str, report_end_date: str, operator_name: str):
+    """Blocking financial analysis — intended to be run via asyncio.to_thread."""
+    logger = logging.getLogger("main")
+    dl_path = Path(financial_path)
+    is_zip = dl_path.suffix.lower() == ".zip"
+    if not is_zip and dl_path.is_file() and dl_path.stat().st_size >= 4:
+        with open(dl_path, "rb") as f:
+            is_zip = f.read(4) == b"PK\x03\x04"
+    if not is_zip:
+        logger.warning("FinancialAgent: file is not a ZIP, skipping: %s", dl_path)
+        return None
+    try:
+        result = analysis_run(
+            dl_path,
+            output_dir=run_dir,
+            report_start_date=report_start_date,
+            report_end_date=report_end_date,
+            operator_name=operator_name,
+            write_file=False,
+        )
+        return result if isinstance(result, list) else None
+    except Exception as e:
+        logging.getLogger("main").warning("AnalysisAgent failed (non-fatal): %s", e)
+        return None
+
+
 async def _analysis_phase(
     marketing_path: Path | None,
     financial_path: Path | None,
@@ -96,53 +165,34 @@ async def _analysis_phase(
     report_start_date: str,
     report_end_date: str,
 ) -> Path | None:
-    """Run Financial + Marketing analysis and combined report (called while browser is paused). Returns combined_path for campaign combos."""
+    """Run Financial + Marketing analysis in parallel, then build combined report. Returns combined_path."""
     logger = logging.getLogger("main")
     if not marketing_path and not financial_path:
         raise RuntimeError("DoorDash (browser-use) did not return any downloaded file path")
 
-    financial_sheets = None
-    marketing_sheets = None
+    operator_name = get_optional_env("OPERATOR_NAME")
+
+    # Run both analyses concurrently — they are pure CPU/IO and don't share state
+    marketing_task = (
+        asyncio.to_thread(_run_marketing, Path(marketing_path), run_dir, report_start_date, report_end_date, operator_name)
+        if marketing_path else asyncio.sleep(0, result=None)
+    )
+    financial_task = (
+        asyncio.to_thread(_run_financial, Path(financial_path), run_dir, report_start_date, report_end_date, operator_name)
+        if financial_path else asyncio.sleep(0, result=None)
+    )
 
     if marketing_path:
         logger.info("Marketing report: %s", marketing_path)
-        try:
-            result = marketing_run(
-                Path(marketing_path),
-                output_dir=run_dir,
-                post_start_date=report_start_date,
-                post_end_date=report_end_date,
-                operator_name=get_optional_env("OPERATOR_NAME"),
-                write_file=False,
-            )
-            if isinstance(result, list):
-                marketing_sheets = result
-                logger.info("MarketingAgent built %s sheets", len(marketing_sheets))
-        except Exception as marketing_err:
-            logger.warning("MarketingAgent failed (non-fatal): %s", marketing_err)
-
     if financial_path:
         logger.info("Financial report: %s", financial_path)
-        dl_path = Path(financial_path)
-        is_zip = dl_path.suffix.lower() == ".zip"
-        if not is_zip and dl_path.is_file() and dl_path.stat().st_size >= 4:
-            with open(dl_path, "rb") as f:
-                is_zip = f.read(4) == b"PK\x03\x04"
-        if is_zip:
-            try:
-                result = analysis_run(
-                    dl_path,
-                    output_dir=run_dir,
-                    report_start_date=report_start_date,
-                    report_end_date=report_end_date,
-                    operator_name=get_optional_env("OPERATOR_NAME"),
-                    write_file=False,
-                )
-                if isinstance(result, list):
-                    financial_sheets = result
-                    logger.info("AnalysisAgent built %s sheets", len(financial_sheets))
-            except Exception as analysis_err:
-                logger.warning("AnalysisAgent failed (non-fatal): %s", analysis_err)
+
+    marketing_sheets, financial_sheets = await asyncio.gather(marketing_task, financial_task)
+
+    if marketing_sheets:
+        logger.info("MarketingAgent built %s sheets", len(marketing_sheets))
+    if financial_sheets:
+        logger.info("AnalysisAgent built %s sheets", len(financial_sheets))
 
     combined_path = None
     if financial_sheets or marketing_sheets:
@@ -215,8 +265,9 @@ async def run_workflow() -> None:
             last_error = e
             logger.warning("Attempt %d failed: %s", attempt, e, exc_info=True)
             if attempt < MAX_RETRIES:
-                logger.info("Retrying in %s seconds...", RETRY_DELAY_SEC)
-                await asyncio.sleep(RETRY_DELAY_SEC)
+                delay = RETRY_BASE_DELAY_SEC * (2 ** (attempt - 1))  # 5s, 10s, 20s, ...
+                logger.info("Retrying in %s seconds (attempt %d/%d)...", delay, attempt + 1, MAX_RETRIES)
+                await asyncio.sleep(delay)
             else:
                 break
 

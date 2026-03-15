@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,6 +25,34 @@ logger = logging.getLogger(__name__)
 SHEET_TITLE_MAX_LEN = 100
 # Characters not allowed in sheet titles
 SHEET_TITLE_FORBIDDEN = re.compile(r'[*?\:/\\\[\]]')
+
+# Retry config for transient Google API errors
+_MAX_API_RETRIES = 3
+_RETRY_BASE_DELAY = 2  # seconds, doubles each retry
+
+
+def _retry_api_call(operation_name: str, fn, *args, **kwargs):
+    """Execute a Google API call with exponential backoff on transient errors."""
+    from googleapiclient.errors import HttpError
+
+    last_err = None
+    for attempt in range(1, _MAX_API_RETRIES + 1):
+        try:
+            return fn(*args, **kwargs)
+        except HttpError as e:
+            status = getattr(getattr(e, "resp", None), "status", None)
+            # Retry on rate limit (429) and server errors (500, 502, 503)
+            if status in (429, 500, 502, 503) and attempt < _MAX_API_RETRIES:
+                delay = _RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.warning(
+                    "GooglePusherAgent: %s failed (status=%s), retry %d/%d in %ds",
+                    operation_name, status, attempt, _MAX_API_RETRIES, delay,
+                )
+                time.sleep(delay)
+                last_err = e
+            else:
+                raise
+    raise last_err  # unreachable, but satisfies type checker
 
 
 def _load_credentials():
@@ -75,6 +104,20 @@ def _load_credentials():
         "Google Sheets credentials not found. Set GCP_SERVICE_ACCOUNT_JSON (JSON string), "
         "GCP_CREDENTIALS_PATH or GOOGLE_APPLICATION_CREDENTIALS (path to JSON), or place "
         "todc-marketing-*.json in the project root."
+    )
+
+
+def _validate_credentials(creds) -> None:
+    """Verify service account credentials have required fields before making API calls."""
+    email = getattr(creds, "service_account_email", None) or ""
+    if not email:
+        logger.warning("GooglePusherAgent: Could not determine service_account_email from credentials")
+    project = getattr(creds, "project_id", None) or ""
+    if not project:
+        logger.warning("GooglePusherAgent: Could not determine project_id from credentials")
+    logger.info(
+        "GooglePusherAgent: Validated credentials — email=%s, project=%s",
+        email or "(unknown)", project or "(unknown)",
     )
 
 
@@ -183,21 +226,119 @@ def _build_combined_sheets(
     return order, data
 
 
+def _write_to_existing_spreadsheet(
+    sheets_service,
+    spreadsheet_id: str,
+    order: List[str],
+    data: Dict[str, List[List[Any]]],
+) -> Dict[str, Any]:
+    """
+    Write all sheets into an already-existing spreadsheet.
+    Creates missing tabs, clears and rewrites existing ones.
+    Returns result dict (same shape as push_to_sheets).
+    """
+    from googleapiclient.errors import HttpError
+
+    spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+
+    # Fetch existing sheet titles
+    try:
+        meta = _retry_api_call(
+            "get spreadsheet metadata",
+            sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute,
+        )
+    except HttpError as e:
+        _log_http_error("get spreadsheet metadata", e)
+        raise
+
+    existing_sheets = {s["properties"]["title"]: s["properties"]["sheetId"]
+                       for s in meta.get("sheets", [])}
+
+    # Build list of sheets that need to be added
+    requests = []
+    for title in order:
+        safe = _sanitize_sheet_title(title)
+        if safe not in existing_sheets:
+            requests.append({"addSheet": {"properties": {"title": safe}}})
+
+    if requests:
+        logger.info("GooglePusherAgent: Adding %d new tab(s)", len(requests))
+        try:
+            _retry_api_call(
+                "batchUpdate (add sheets)",
+                sheets_service.spreadsheets().batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body={"requests": requests},
+                ).execute,
+            )
+        except HttpError as e:
+            _log_http_error("batchUpdate (add sheets)", e)
+            raise
+
+    # Clear then write each sheet
+    value_ranges = []
+    clear_ranges = []
+    for title in order:
+        safe = _sanitize_sheet_title(title)
+        rows = data.get(title, [])
+        if not rows:
+            continue
+        range_name = f"'{safe}'!A1"
+        clear_ranges.append(range_name)
+        value_ranges.append({"range": range_name, "values": rows})
+
+    if clear_ranges:
+        try:
+            _retry_api_call(
+                "batchClear",
+                sheets_service.spreadsheets().values().batchClear(
+                    spreadsheetId=spreadsheet_id,
+                    body={"ranges": clear_ranges},
+                ).execute,
+            )
+        except HttpError as e:
+            _log_http_error("batchClear", e)
+            # Non-fatal — continue with write
+
+    if value_ranges:
+        logger.info("GooglePusherAgent: Writing %d sheet(s) to existing spreadsheet", len(value_ranges))
+        try:
+            _retry_api_call(
+                "batchUpdate (write values)",
+                sheets_service.spreadsheets().values().batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body={"valueInputOption": "USER_ENTERED", "data": value_ranges},
+                ).execute,
+            )
+            logger.info("GooglePusherAgent: batchUpdate completed successfully")
+        except HttpError as e:
+            _log_http_error("batchUpdate (write values)", e)
+            raise
+
+    return {
+        "spreadsheet_id": spreadsheet_id,
+        "spreadsheet_url": spreadsheet_url,
+        "sheet_count": len(value_ranges),
+    }
+
+
 def push_to_sheets(
     financial_xlsx_path: Optional[Path] = None,
     marketing_xlsx_path: Optional[Path] = None,
     spreadsheet_title: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Create one Google Sheets file with all sheets from the financial and marketing Excel files.
+    Push all Excel sheets into Google Sheets.
 
-    Args:
-        financial_xlsx_path: Path to financial_analysis_*.xlsx
-        marketing_xlsx_path: Path to marketing_analysis_*.xlsx
-        spreadsheet_title: Title for the new spreadsheet (default: "DoorDash Reports YYYY-MM-DD HH:MM")
+    Mode 1 (recommended): Set GOOGLE_SPREADSHEET_ID in .env → writes into that existing sheet.
+      - Create a blank Google Sheet, share it with the service-account email as Editor, copy the ID.
+      - Works even when the SA cannot create new Drive files (org/Workspace restrictions).
+
+    Mode 2 (fallback): No GOOGLE_SPREADSHEET_ID → tries to create a new spreadsheet.
+      - Requires the SA to have Drive file-creation permission.
 
     Returns:
-        Dict with spreadsheet_id, spreadsheet_url, sheet_count; or None if no data or on error.
+        Dict with spreadsheet_id, spreadsheet_url, sheet_count; or None on error.
     """
     from datetime import datetime
     from googleapiclient.discovery import build
@@ -215,7 +356,7 @@ def push_to_sheets(
     if not order or not data:
         logger.warning("GooglePusherAgent: No sheet data to push (missing or empty Excel files)")
         return None
-    logger.info("GooglePusherAgent: Built %s sheets to push: %s", len(order), order[:5])  # first 5 names
+    logger.info("GooglePusherAgent: Built %s sheets to push: %s", len(order), order[:5])
 
     try:
         creds = _load_credentials()
@@ -223,51 +364,73 @@ def push_to_sheets(
         logger.warning("GooglePusherAgent: Skipping push - %s", e)
         return None
 
+    _validate_credentials(creds)
+
     logger.info("GooglePusherAgent: Building Sheets API client (sheets v4)...")
     sheets_service = build("sheets", "v4", credentials=creds)
 
+    # --- Mode 1: write to existing spreadsheet (no Drive create permission needed) ---
+    existing_id = os.environ.get("GOOGLE_SPREADSHEET_ID", "").strip()
+    if existing_id:
+        logger.info("GooglePusherAgent: Writing to existing spreadsheet id=%s", existing_id)
+        try:
+            result = _write_to_existing_spreadsheet(sheets_service, existing_id, order, data)
+            logger.info("GooglePusherAgent: Pushed %d sheets to %s", result["sheet_count"], result["spreadsheet_url"])
+            return result
+        except HttpError as e:
+            _log_http_error("write to existing spreadsheet", e)
+            return None
+
+    # --- Mode 2: create a new spreadsheet ---
     if not spreadsheet_title:
         spreadsheet_title = f"DoorDash Reports {datetime.now().strftime('%Y-%m-%d %H:%M')}"
 
-    # Create spreadsheet with one sheet per tab (first sheet is default)
-    sheet_properties = [{"properties": {"title": _sanitize_sheet_title(title)}} for title in order]
+    sheet_properties = [{"properties": {"title": _sanitize_sheet_title(t)}} for t in order]
     body = {
         "properties": {"title": spreadsheet_title[:SHEET_TITLE_MAX_LEN]},
         "sheets": sheet_properties,
     }
-    logger.info("GooglePusherAgent: Creating spreadsheet title=%s, sheets=%s", spreadsheet_title, len(order))
+    logger.info("GooglePusherAgent: Creating new spreadsheet title=%s, sheets=%s", spreadsheet_title, len(order))
     try:
-        create_res = sheets_service.spreadsheets().create(body=body).execute()
+        create_res = _retry_api_call(
+            "create spreadsheet",
+            sheets_service.spreadsheets().create(body=body).execute,
+        )
     except HttpError as e:
         _log_http_error("create spreadsheet", e)
+        logger.warning(
+            "GooglePusherAgent: Cannot create new spreadsheet (403 = SA lacks Drive create permission). "
+            "Fix: create a blank Google Sheet manually, share it with the service-account email as Editor, "
+            "then set GOOGLE_SPREADSHEET_ID=<id> in .env."
+        )
         return None
 
     spreadsheet_id = create_res["spreadsheetId"]
     spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
     logger.info("GooglePusherAgent: Spreadsheet created id=%s url=%s", spreadsheet_id, spreadsheet_url)
 
-    # Write data to each sheet
     value_ranges = []
     for title in order:
         rows = data.get(title, [])
         if not rows:
             continue
-        # Sheet name in range: quote if it contains spaces/special
         safe_title = _sanitize_sheet_title(title)
-        range_name = f"'{safe_title}'!A1"
-        value_ranges.append({"range": range_name, "values": rows})
+        value_ranges.append({"range": f"'{safe_title}'!A1", "values": rows})
 
     if value_ranges:
-        logger.info("GooglePusherAgent: Writing data to %s sheet(s) (batchUpdate)...", len(value_ranges))
+        logger.info("GooglePusherAgent: Writing %d sheet(s) via batchUpdate", len(value_ranges))
         try:
-            sheets_service.spreadsheets().values().batchUpdate(
-                spreadsheetId=spreadsheet_id,
-                body={"valueInputOption": "USER_ENTERED", "data": value_ranges},
-            ).execute()
+            _retry_api_call(
+                "batchUpdate (write values to new sheet)",
+                sheets_service.spreadsheets().values().batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body={"valueInputOption": "USER_ENTERED", "data": value_ranges},
+                ).execute,
+            )
             logger.info("GooglePusherAgent: batchUpdate completed successfully")
         except HttpError as e:
             _log_http_error("batchUpdate (write values)", e)
-            # Spreadsheet was created; still return link
+
     logger.info("GooglePusherAgent: Pushed %s sheets to %s", len(order), spreadsheet_url)
     return {
         "spreadsheet_id": spreadsheet_id,

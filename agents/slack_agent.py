@@ -1,9 +1,11 @@
 """
 Slack Agent: Pushes specific terminal steps to a designated Slack channel.
 Uses standard Incoming Webhooks API.
+HTTP calls run in a background daemon thread so they never block the async event loop.
 """
 import logging
 import os
+import threading
 from pathlib import Path
 
 import requests
@@ -49,17 +51,19 @@ def push_to_slack(message: str) -> None:
             _slack_skipped_logged = True
         return
 
-    try:
-        payload = {"text": message}
-        response = requests.post(webhook_url, json=payload, timeout=10)
+    def _send(url: str, msg: str) -> None:
+        """Fire-and-forget in a daemon thread — never blocks the event loop."""
+        try:
+            resp = requests.post(url, json={"text": msg}, timeout=10)
+            if resp.status_code in (200, 201):
+                logger.debug("Slack: message sent")
+            else:
+                logger.warning(
+                    "SlackAgent: Failed to push to Slack. HTTP %s — %s",
+                    resp.status_code,
+                    resp.text[:200] if resp.text else "",
+                )
+        except requests.exceptions.RequestException as e:
+            logger.warning("SlackAgent: Error while pushing to Slack: %s", e)
 
-        if response.status_code in (200, 201):
-            logger.debug("Slack: message sent")
-        else:
-            logger.warning(
-                "SlackAgent: Failed to push to Slack. HTTP %s — %s",
-                response.status_code,
-                response.text[:200] if response.text else "",
-            )
-    except requests.exceptions.RequestException as e:
-        logger.warning("SlackAgent: Error while pushing to Slack: %s", e)
+    threading.Thread(target=_send, args=(webhook_url, message), daemon=True).start()

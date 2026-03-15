@@ -10,11 +10,34 @@ Alternatively set BROWSER_USE_API_KEY to use Browser Use Cloud (may fail with
 
 import asyncio
 import os
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def _get_date_range() -> tuple[str, str]:
+    """
+    Return (start_date, end_date) as MM/DD/YYYY.
+    Reads REPORT_START_DATE / REPORT_END_DATE from env if set,
+    otherwise computes the last 3 full months automatically.
+    """
+    start = os.getenv("REPORT_START_DATE", "").strip()
+    end = os.getenv("REPORT_END_DATE", "").strip()
+    if start and end:
+        return start, end
+    today = datetime.now().date()
+    first_this_month = today.replace(day=1)
+    last_prev_month = first_this_month - timedelta(days=1)
+    y, m = first_this_month.year, first_this_month.month
+    m -= 3
+    if m <= 0:
+        m += 12
+        y -= 1
+    first_three_months_ago = datetime(y, m, 1).date()
+    return first_three_months_ago.strftime("%m/%d/%Y"), last_prev_month.strftime("%m/%d/%Y")
 
 DOWNLOAD_DIR = Path(__file__).resolve().parent / "downloads"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -66,11 +89,13 @@ async def main():
     if not email or not password:
         raise SystemExit("Set DOORDASH_EMAIL and DOORDASH_PASSWORD in .env")
 
+    start_date, end_date = _get_date_range()
+
     task = (
         "Log in to the DoorDash Merchant Portal at https://merchant-portal.doordash.com/merchant/ "
         f"using this email: {email} and this password: {password}. "
         "Then open the Reports section, create a new report, select Financial report, "
-        "set the date range from January 1 2026 to January 31 2026, create the report, "
+        f"set the date range from {start_date} to {end_date}, create the report, "
         "wait for it to finish generating, then click Download. "
         f"Ensure the file is saved to this folder: {DOWNLOAD_DIR.resolve()}."
     )

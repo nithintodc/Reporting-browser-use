@@ -21,16 +21,37 @@ except ImportError:
 
 
 def _mock_streamlit() -> None:
-    """Install a minimal streamlit mock so marketing_analysis can be imported without Streamlit."""
+    """
+    Install a catch-all streamlit mock so marketing_analysis can be imported without Streamlit.
+    Any attribute access returns a no-op callable/context manager so future streamlit API
+    additions don't break the mock.
+    """
     import types
-    mock = types.ModuleType("streamlit")
-    mock.error = lambda *a, **k: None
-    mock.warning = lambda *a, **k: None
-    mock.info = lambda *a, **k: None
-    mock.success = lambda *a, **k: None
-    mock.session_state = {}
-    mock.cache_data = lambda f: f
-    mock.spinner = lambda x: types.SimpleNamespace(__enter__=lambda s: None, __exit__=lambda s, *a: None)
+
+    def _noop(*args, **kwargs):
+        return None
+
+    class _NoopCtx:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+
+    def _noop_ctx(*args, **kwargs):
+        return _NoopCtx()
+
+    class _MockStreamlit(types.ModuleType):
+        """Module subclass — __getattr__ absorbs any unknown streamlit attribute."""
+        session_state: dict = {}
+        cache_data = staticmethod(lambda f: f)  # decorator — returns the function unchanged
+
+        def __getattr__(self, name: str):
+            # Return context manager for known context-manager patterns, else plain no-op
+            if name in ("spinner", "expander", "container", "sidebar", "form", "empty"):
+                return _noop_ctx
+            return _noop
+
+    mock = _MockStreamlit("streamlit")
     sys.modules["streamlit"] = mock
 
 

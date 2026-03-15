@@ -183,6 +183,41 @@ def load_subtotal_tags(subtotal_tags_path: Path) -> dict:
     return result
 
 
+def _load_store_id_to_name(xl) -> dict:
+    """
+    Read Store-wise sheet from combined analysis workbook to build store_id → store_name mapping.
+    Looks for columns 'Merchant Store ID' and 'Store Name' (header at row 3, 0-indexed row 2).
+    Returns empty dict if sheet/columns not found.
+    """
+    if pd is None:
+        return {}
+    mapping = {}
+    for sheet_name in xl.sheet_names:
+        if sheet_name.lower().replace("-", "").replace(" ", "") in ("storewise", "financialstorewise"):
+            try:
+                df = pd.read_excel(xl, sheet_name=sheet_name, header=2)
+                df.columns = df.columns.astype(str).str.strip()
+                id_col = None
+                name_col = None
+                for c in df.columns:
+                    cl = c.lower()
+                    if cl in ("merchant store id", "store id"):
+                        id_col = c
+                    elif cl == "store name":
+                        name_col = c
+                if id_col and name_col:
+                    for _, row in df.dropna(subset=[id_col]).iterrows():
+                        sid = str(row[id_col]).strip()
+                        sname = str(row[name_col]).strip() if pd.notna(row[name_col]) else ""
+                        if sid and sname:
+                            mapping[sid] = sname
+                    logger.info("campaign_params: loaded %d store ID→name mappings from %s", len(mapping), sheet_name)
+                    break
+            except Exception as e:
+                logger.debug("campaign_params: could not read store names from %s: %s", sheet_name, e)
+    return mapping
+
+
 def get_store_ids_from_combined_analysis(combined_xlsx_path: Path) -> List[str]:
     """
     Read combined analysis workbook and return list of store IDs from Day-Slot sheet names.
@@ -337,18 +372,29 @@ def get_campaign_combos_from_slots_and_combined(
         logger.warning("campaign_params: no subtotal->tags derived from Day-Slot sheets")
         return []
 
+    # Load store ID → name mapping for fallback search in campaign creation
+    try:
+        xl = pd.ExcelFile(combined_path)
+        store_id_to_name = _load_store_id_to_name(xl)
+    except Exception:
+        store_id_to_name = {}
+
     combos: List[dict] = []
     for store_id, subtotal_to_tags in per_store.items():
         for min_subtotal, tags in subtotal_to_tags.items():
             if not tags:
                 continue
             campaign_name = f"TODC-{store_id}-${min_subtotal}"
-            combos.append({
+            combo = {
                 "store_id": store_id,
                 "min_subtotal": min_subtotal,
                 "slot_tags": list(tags),
                 "campaign_name": campaign_name,
-            })
+            }
+            store_name = store_id_to_name.get(store_id, "")
+            if store_name:
+                combo["store_name"] = store_name
+            combos.append(combo)
 
     logger.info(
         "campaign_params: derived %s campaign combos from Day-Slot sheets + slots grid (%s stores)",
@@ -356,109 +402,6 @@ def get_campaign_combos_from_slots_and_combined(
         len(per_store),
     )
     return combos
-
-
-def get_campaign_params_from_combined_analysis(combined_xlsx_path: Path) -> Optional[dict]:
-    """
-    Read the first Day-Slot - {storeID} sheet from combined_analysis_*.xlsx.
-
-    Returns a dict with:
-        store_id: str (e.g. "14351")
-        day: str (e.g. "Wednesday")
-        slot: str (e.g. "Lunch")
-        min_subtotal: float (e.g. 20.0)
-        campaign_name: str (e.g. "14351-Lunch-Wednesday")
-
-    Returns None if file missing, no matching sheet, or required columns/row missing.
-    """
-    if pd is None:
-        logger.warning("campaign_params: pandas required to read combined analysis")
-        return None
-
-    path = Path(combined_xlsx_path)
-    if not path.is_file() or path.suffix.lower() not in (".xlsx", ".xls"):
-        logger.warning("campaign_params: combined analysis path is not a valid Excel file: %s", path)
-        return None
-
-    try:
-        xl = pd.ExcelFile(path)
-    except Exception as e:
-        logger.warning("campaign_params: could not open Excel file %s: %s", path, e)
-        return None
-
-    # Find first sheet whose name contains "Day-Slot - " and extract store_id
-    target_sheet = None
-    store_id = None
-    for name in xl.sheet_names:
-        if "Day-Slot - " in name or DAY_SLOT_SHEET_PATTERN.search(name):
-            target_sheet = name
-            match = DAY_SLOT_SHEET_PATTERN.search(name)
-            if match:
-                store_id = match.group(1).strip()
-            else:
-                # "Day-Slot - 14351" -> take after "Day-Slot - "
-                idx = name.find("Day-Slot - ")
-                if idx >= 0:
-                    store_id = name[idx + len("Day-Slot - "):].strip()
-            if store_id:
-                break
-
-    if not target_sheet or not store_id:
-        logger.warning("campaign_params: no 'Day-Slot - {storeID}' sheet found in %s", path.name)
-        return None
-
-    # Combined report writes title at row 1, header at row 3 (0-indexed: header=2)
-    try:
-        df = pd.read_excel(xl, sheet_name=target_sheet, header=2)
-    except Exception as e:
-        logger.warning("campaign_params: could not read sheet %s: %s", target_sheet, e)
-        return None
-
-    # Normalize column names (strip whitespace)
-    df.columns = df.columns.astype(str).str.strip()
-
-    required = ["Day", "Slot", "Min.Subtotal"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        logger.warning("campaign_params: sheet %s missing columns: %s (have: %s)", target_sheet, missing, list(df.columns))
-        return None
-
-    # First data row (skip header); drop rows where Day or Slot is NaN
-    data = df.dropna(subset=["Day", "Slot"]).head(1)
-    if data.empty:
-        logger.warning("campaign_params: sheet %s has no data rows with Day and Slot", target_sheet)
-        return None
-
-    row = data.iloc[0]
-    day = str(row["Day"]).strip()
-    slot = str(row["Slot"]).strip()
-    min_val = row["Min.Subtotal"]
-
-    # Parse Min.Subtotal: may be number or string like "$20.00"
-    try:
-        if pd.isna(min_val):
-            min_subtotal = 20.0
-        elif isinstance(min_val, (int, float)):
-            min_subtotal = float(min_val)
-        else:
-            s = str(min_val).strip().replace("$", "").replace(",", "")
-            min_subtotal = float(s) if s else 20.0
-    except (ValueError, TypeError):
-        min_subtotal = 20.0
-
-    if min_subtotal <= 0:
-        min_subtotal = 20.0
-
-    # Campaign name: e.g. TODC-14351-Wednesday-Lunch
-    campaign_name = f"TODC-{store_id}-{day}-{slot}"
-
-    return {
-        "store_id": store_id,
-        "day": day,
-        "slot": slot,
-        "min_subtotal": min_subtotal,
-        "campaign_name": campaign_name,
-    }
 
 
 def get_all_campaign_combos_from_combined_analysis(combined_xlsx_path: Path) -> List[dict]:
@@ -488,6 +431,9 @@ def get_all_campaign_combos_from_combined_analysis(combined_xlsx_path: Path) -> 
     except Exception as e:
         logger.warning("campaign_params: could not open %s: %s", path, e)
         return []
+
+    # Load store ID → name mapping for fallback search in campaign creation
+    store_id_to_name = _load_store_id_to_name(xl)
 
     combos: List[dict] = []
     for sheet_name in xl.sheet_names:
@@ -532,13 +478,17 @@ def get_all_campaign_combos_from_combined_analysis(combined_xlsx_path: Path) -> 
                 min_subtotal = 20.0
 
             campaign_name = f"TODC-{store_id}-{day}-{slot}"
-            combos.append({
+            combo = {
                 "store_id": store_id,
                 "day": day,
                 "slot": slot,
                 "min_subtotal": min_subtotal,
                 "campaign_name": campaign_name,
-            })
+            }
+            store_name = store_id_to_name.get(store_id, "")
+            if store_name:
+                combo["store_name"] = store_name
+            combos.append(combo)
 
     logger.info("campaign_params: found %s campaign combos in %s", len(combos), path.name)
     return combos
