@@ -8,8 +8,12 @@ openpyxl>=3.1.0
 google-api-python-client>=2.100.0
 google-auth>=2.23.0
 
+# HTTP (slack_agent)
+requests>=2.31.0
+
 # Environment & config
 python-dotenv>=1.0.0
 
-# Async (stdlib in 3.11+)
-# No extra deps for asyncio
+# GCP Cloud Logging (optional, for cloud deployment)
+# google-cloud-logging>=3.8.0
+# google-cloud-secret-manager>=2.16.0

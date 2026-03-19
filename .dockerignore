@@ -1,0 +1,17 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.git/
+.DS_Store
+downloads/
+logs/
+*.env
+*.env.*
+.env.local
+todc-marketing-*.json
+*credentials*.json
+*service-account*.json
+.cursor/
+.claude/
+node_modules/

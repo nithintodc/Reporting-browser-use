@@ -336,6 +336,109 @@ def append_campaign_mappings_to_workbook(
         wb.close()
 
 
+def copy_campaign_mappings_from_previous(src_xlsx: Path, dest_xlsx: Path) -> bool:
+    """
+    Copy the Campaign Mappings sheet wholesale from a previous combined analysis
+    into the new one. Returns True if the sheet was successfully copied.
+    """
+    try:
+        import openpyxl
+    except ImportError:
+        return False
+
+    src_path = Path(src_xlsx)
+    dest_path = Path(dest_xlsx)
+    if not src_path.is_file() or not dest_path.is_file():
+        return False
+
+    try:
+        src_wb = openpyxl.load_workbook(src_path, read_only=True, data_only=True)
+    except Exception:
+        return False
+
+    sheet_name = CAMPAIGN_MAPPINGS_SHEET[:31]
+    if sheet_name not in src_wb.sheetnames:
+        src_wb.close()
+        return False
+
+    try:
+        dest_wb = openpyxl.load_workbook(dest_path, read_only=False)
+        if sheet_name in dest_wb.sheetnames:
+            del dest_wb[sheet_name]
+        _copy_sheet_from_book(src_wb, sheet_name, dest_wb, sheet_name)
+        dest_wb.save(dest_path)
+        dest_wb.close()
+        src_wb.close()
+        logger.info("CombinedReportAgent: Copied Campaign Mappings from %s to %s", src_path.name, dest_path.name)
+        return True
+    except Exception as e:
+        logger.warning("CombinedReportAgent: Failed to copy Campaign Mappings: %s", e)
+        src_wb.close()
+        return False
+
+
+def read_campaign_combos_from_mappings(combined_xlsx_path: Path) -> List[Dict[str, Any]]:
+    """
+    Read campaign combos from the Campaign Mappings sheet.
+    Returns list of dicts: {store_id, store_name, min_subtotal, slot_tags, campaign_name, status}.
+    """
+    try:
+        import openpyxl
+    except ImportError:
+        return []
+
+    path = Path(combined_xlsx_path)
+    if not path.is_file():
+        return []
+
+    try:
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    except Exception:
+        return []
+
+    try:
+        sheet_name = CAMPAIGN_MAPPINGS_SHEET[:31]
+        if sheet_name not in wb.sheetnames:
+            return []
+        ws = wb[sheet_name]
+        combos: List[Dict[str, Any]] = []
+        for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            if row_idx == 1:
+                continue  # skip header
+            if not row or len(row) < 5:
+                continue
+            store_id = str(row[0] or "").strip()
+            store_name = str(row[1] or "").strip()
+            min_subtotal = row[2] if row[2] is not None else 10
+            slot_tags_str = str(row[3] or "").strip()
+            campaign_name = str(row[4] or "").strip()
+            status = str(row[5] or "Pending").strip() if len(row) >= 6 and row[5] else "Pending"
+
+            # Parse slot_tags from comma-separated string
+            slot_tags = []
+            if slot_tags_str:
+                for t in slot_tags_str.split(","):
+                    t = t.strip()
+                    if t:
+                        try:
+                            slot_tags.append(int(float(t)))
+                        except (ValueError, TypeError):
+                            pass
+
+            if campaign_name:
+                combos.append({
+                    "store_id": store_id,
+                    "store_name": store_name,
+                    "min_subtotal": min_subtotal,
+                    "slot_tags": slot_tags,
+                    "campaign_name": campaign_name,
+                    "status": status,
+                })
+        return combos
+    finally:
+        wb.close()
+
+
 def run(
     financial_xlsx_path: Optional[Path] = None,
     marketing_xlsx_path: Optional[Path] = None,

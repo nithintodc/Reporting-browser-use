@@ -7,6 +7,8 @@ Returns paths to downloaded report file(s) for use by analysis_agent and marketi
 import asyncio
 import logging
 import os
+import re
+import time
 import zipfile
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, Tuple
@@ -15,19 +17,533 @@ from typing import Awaitable, Callable, Optional, Tuple
 AGENT_REPORTS_TIMEOUT = 900   # 15 min: login + create 2 reports + download both
 AGENT_LOGIN_TIMEOUT = 180     # 3 min: re-login after browser restart
 AGENT_RESET_TIMEOUT = 90      # 1.5 min: navigate to Marketing page between campaigns
-AGENT_CAMPAIGN_TIMEOUT = 360  # 6 min: create one campaign end-to-end
+AGENT_CAMPAIGN_TIMEOUT = 720  # 12 min: create one campaign end-to-end (increased from 540 to handle many-slot campaigns)
 
 # Campaigns per browser session before restart; override via env for tuning
 MAX_CAMPAIGNS_PER_SESSION = int(os.getenv("MAX_CAMPAIGNS_PER_SESSION", "5"))
 
 from agents.combined_report_agent import (
     append_campaign_mappings_to_workbook,
+    copy_campaign_mappings_from_previous,
+    read_campaign_combos_from_mappings,
     read_campaign_mapping_statuses,
     update_campaign_mapping_status,
 )
 from agents.slack_agent import push_to_slack
 
 logger = logging.getLogger(__name__)
+
+
+def _build_campaign_tools():
+    """
+    Build a Tools instance with a custom 'set_schedule_grid' action.
+    Uses CDP Input.dispatchMouseEvent (native browser input pipeline) to click grid cells,
+    which reliably triggers React's synthetic event system — unlike JS dispatchEvent which doesn't.
+    """
+    from browser_use import Tools
+    from browser_use.agent.views import ActionResult
+
+    tools = Tools()
+
+    _GRID_ROW_NAMES = ["Early morning", "Breakfast", "Lunch", "Afternoon", "Dinner", "Late night"]
+    _GRID_COL_NAMES = ["Mon", "Tue", "Wed", "Thur", "Fri", "Sat", "Sun"]
+
+    def _tag_label(tag: int) -> str:
+        """Human-readable label for a tag number, e.g. 8 → 'Breakfast/Mon'."""
+        row_idx = (tag - 1) // 7
+        col_idx = (tag - 1) % 7
+        return f"{_GRID_ROW_NAMES[row_idx]}/{_GRID_COL_NAMES[col_idx]}"
+
+    @tools.action(
+        description=(
+            "Set the DoorDash campaign schedule grid to exactly the desired state. "
+            "Pass 'wanted_tags' as a comma-separated string of tag numbers (1-42) that should be CHECKED. "
+            "Grid layout: 6 rows (Early morning, Breakfast, Lunch, Afternoon, Dinner, Late night) x 7 cols (Mon-Sun). "
+            "Tag 1 = Mon/Early morning, Tag 2 = Tue/Early morning, ..., Tag 7 = Sun/Early morning, "
+            "Tag 8 = Mon/Breakfast, ..., Tag 42 = Sun/Late night. "
+            "This action detects current cell states and only toggles cells that need to change, then clicks Save. "
+            "Example: wanted_tags='1,2,3,8,9' means check Mon/Tue/Wed Early morning + Mon/Tue Breakfast. "
+            "IMPORTANT: Call this ONCE after the custom schedule grid is visible. Do NOT manually click any grid cells."
+        ),
+    )
+    async def set_schedule_grid(wanted_tags: str, browser_session) -> ActionResult:
+        """Detect current grid state, toggle only cells that need changing, using CDP native clicks."""
+        try:
+            wanted = set()
+            for t in wanted_tags.split(","):
+                t = t.strip()
+                if t and t.isdigit():
+                    wanted.add(int(t))
+
+            logger.info("set_schedule_grid CALLED: wanted_tags=%s → wanted=%s", wanted_tags, sorted(wanted))
+            logger.info("set_schedule_grid: wanted cells: %s",
+                        ", ".join(f"{t}({_tag_label(t)})" for t in sorted(wanted)))
+
+            cdp_session = await browser_session.get_or_create_cdp_session()
+            cdp_client = cdp_session.cdp_client
+            session_id = cdp_session.session_id
+
+            # Step 1: Find grid cells, detect their checked state, and get viewport coordinates.
+            # Checked cells have a visible checkmark (SVG path with non-zero opacity / colored fill).
+            # Unchecked cells have a hidden/transparent SVG.
+            js_find_grid = """
+(function() {
+    // Find Weekdays button to anchor in the schedule modal
+    var weekdaysBtn = null;
+    var allBtns = document.querySelectorAll('button');
+    for (var i = 0; i < allBtns.length; i++) {
+        if (allBtns[i].textContent.trim() === 'Weekdays') { weekdaysBtn = allBtns[i]; break; }
+    }
+    if (!weekdaysBtn) return JSON.stringify({error: 'No Weekdays button found on page'});
+
+    // Walk up to find modal container
+    var container = weekdaysBtn;
+    for (var up = 0; up < 12; up++) {
+        container = container.parentElement;
+        if (!container) break;
+    }
+    if (!container) return JSON.stringify({error: 'Could not find modal container'});
+
+    // Find grid rows — divs with exactly 7 children that each contain an SVG
+    var rows = [];
+    var candidateRows = container.querySelectorAll('div[class*="StyledInlineChildren"]');
+    for (var r = 0; r < candidateRows.length; r++) {
+        var row = candidateRows[r];
+        if (row.children.length === 7) {
+            var allHaveSvg = true;
+            for (var c = 0; c < 7; c++) {
+                if (!row.children[c].querySelector('svg')) { allHaveSvg = false; break; }
+            }
+            if (allHaveSvg) rows.push(row);
+        }
+    }
+    // Fallback
+    if (rows.length < 6) {
+        rows = [];
+        var allDivs = container.querySelectorAll('div');
+        for (var d = 0; d < allDivs.length; d++) {
+            var div = allDivs[d];
+            if (div.children.length === 7) {
+                var ok = true;
+                for (var c2 = 0; c2 < 7; c2++) {
+                    if (!div.children[c2].querySelector('svg')) { ok = false; break; }
+                }
+                if (ok) rows.push(div);
+            }
+        }
+    }
+    if (rows.length < 6) return JSON.stringify({error: 'Found ' + rows.length + ' grid rows, expected 6'});
+
+    // Detect checked state for each cell.
+    // Strategy: check background color of the cell div, or SVG checkmark visibility.
+    // DoorDash selected cells have a teal/green background; unselected have white/light gray.
+    function isChecked(cellDiv) {
+        var style = window.getComputedStyle(cellDiv);
+        var bg = style.backgroundColor;
+        // Also check the first child div (sometimes the colored background is on inner div)
+        var innerDiv = cellDiv.querySelector('div');
+        var innerBg = innerDiv ? window.getComputedStyle(innerDiv).backgroundColor : '';
+
+        // Check for teal/green-ish backgrounds (selected state)
+        // Teal: rgb(0, 175, 169) or similar; selected cells are NOT white/transparent
+        function isTealish(color) {
+            if (!color || color === 'rgba(0, 0, 0, 0)' || color === 'transparent') return false;
+            // Parse rgb values
+            var m = color.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
+            if (!m) return false;
+            var r = parseInt(m[1]), g = parseInt(m[2]), b = parseInt(m[3]);
+            // White or very light (unselected)
+            if (r > 240 && g > 240 && b > 240) return false;
+            // Near-white grays
+            if (r > 220 && g > 220 && b > 220 && Math.abs(r-g) < 15 && Math.abs(g-b) < 15) return false;
+            // Has significant color = selected
+            return true;
+        }
+
+        if (isTealish(bg)) return true;
+        if (isTealish(innerBg)) return true;
+
+        // Fallback: check SVG path opacity
+        var svg = cellDiv.querySelector('svg');
+        if (svg) {
+            var path = svg.querySelector('path');
+            if (path) {
+                var pathStyle = window.getComputedStyle(path);
+                var stroke = pathStyle.stroke;
+                var fill = pathStyle.fill;
+                // If path has visible stroke/fill (not transparent/none)
+                if (stroke && stroke !== 'none' && stroke !== 'rgba(0, 0, 0, 0)') return true;
+                if (fill && fill !== 'none' && fill !== 'rgba(0, 0, 0, 0)') {
+                    // Check it's not white
+                    var fm = fill.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
+                    if (fm) {
+                        var fr = parseInt(fm[1]), fg = parseInt(fm[2]), fb = parseInt(fm[3]);
+                        if (fr < 240 || fg < 240 || fb < 240) return true;
+                    }
+                }
+            }
+            // Check svg visibility/opacity
+            var svgStyle = window.getComputedStyle(svg);
+            if (svgStyle.opacity === '0' || svgStyle.visibility === 'hidden') return false;
+        }
+
+        // Final fallback: check aria-checked or data attributes
+        if (cellDiv.getAttribute('aria-checked') === 'true') return true;
+        if (cellDiv.getAttribute('aria-checked') === 'false') return false;
+
+        // Default: assume checked (grid usually starts fully selected)
+        return true;
+    }
+
+    var result = {cells: [], saveBtn: null};
+    for (var ri = 0; ri < 6; ri++) {
+        for (var ci = 0; ci < 7; ci++) {
+            var cell = rows[ri].children[ci];
+            var rect = cell.getBoundingClientRect();
+            var checked = isChecked(cell);
+            result.cells.push({
+                tag: ri * 7 + ci + 1,
+                x: Math.round(rect.left + rect.width / 2),
+                y: Math.round(rect.top + rect.height / 2),
+                checked: checked
+            });
+        }
+    }
+
+    // Find Save button
+    var modalBtns = container.querySelectorAll('button');
+    for (var j = 0; j < modalBtns.length; j++) {
+        var btnTxt = modalBtns[j].textContent.trim();
+        if (btnTxt === 'Save' || btnTxt === 'Save schedule') {
+            var sRect = modalBtns[j].getBoundingClientRect();
+            result.saveBtn = {x: Math.round(sRect.left + sRect.width / 2), y: Math.round(sRect.top + sRect.height / 2)};
+            break;
+        }
+    }
+    return JSON.stringify(result);
+})()
+"""
+            # Get grid state + coordinates
+            eval_result = await cdp_client.send.Runtime.evaluate(
+                params={"expression": js_find_grid, "returnByValue": True, "awaitPromise": True},
+                session_id=session_id,
+            )
+            if eval_result.get("exceptionDetails"):
+                err = eval_result["exceptionDetails"].get("text", "Unknown JS error")
+                logger.warning("set_schedule_grid JS error: %s", err)
+                return ActionResult(error=f"JavaScript error finding grid: {err}")
+
+            import json
+            raw_val = eval_result.get("result", {}).get("value", "{}")
+            grid_info = json.loads(raw_val) if isinstance(raw_val, str) else raw_val
+
+            if "error" in grid_info:
+                logger.warning("set_schedule_grid: %s", grid_info["error"])
+                return ActionResult(error=grid_info["error"])
+
+            cells = grid_info["cells"]  # list of {tag, x, y, checked}
+            save_btn = grid_info.get("saveBtn")
+
+            if len(cells) != 42:
+                return ActionResult(error=f"Expected 42 cells, found {len(cells)}")
+
+            # Log current grid state
+            currently_checked = {c["tag"] for c in cells if c.get("checked")}
+            currently_unchecked = {c["tag"] for c in cells if not c.get("checked")}
+            logger.info("set_schedule_grid: CURRENT STATE: %d checked, %d unchecked",
+                        len(currently_checked), len(currently_unchecked))
+            logger.info("set_schedule_grid: currently checked tags: %s", sorted(currently_checked))
+            logger.info("set_schedule_grid: currently unchecked tags: %s", sorted(currently_unchecked))
+
+            # Determine which cells need to be TOGGLED:
+            # - Cells that are checked but should NOT be → click to uncheck
+            # - Cells that are unchecked but SHOULD be → click to check
+            need_uncheck = currently_checked - wanted   # checked but unwanted
+            need_check = wanted - currently_checked      # unchecked but wanted
+            no_change = wanted & currently_checked       # already correct
+
+            logger.info("set_schedule_grid: PLAN: %d to uncheck, %d to check, %d already correct",
+                        len(need_uncheck), len(need_check), len(no_change))
+            if need_uncheck:
+                logger.info("set_schedule_grid: UNCHECK: %s",
+                            ", ".join(f"{t}({_tag_label(t)})" for t in sorted(need_uncheck)))
+            if need_check:
+                logger.info("set_schedule_grid: CHECK: %s",
+                            ", ".join(f"{t}({_tag_label(t)})" for t in sorted(need_check)))
+
+            to_click = need_uncheck | need_check  # all cells that need toggling
+
+            # Helper: click at viewport coordinates using CDP Input.dispatchMouseEvent
+            async def cdp_click(x: int, y: int):
+                await cdp_client.send.Input.dispatchMouseEvent(
+                    params={"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1},
+                    session_id=session_id,
+                )
+                await cdp_client.send.Input.dispatchMouseEvent(
+                    params={"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1},
+                    session_id=session_id,
+                )
+                await asyncio.sleep(0.05)  # tiny delay for React to process
+
+            # Click all cells that need toggling using coordinates from the initial scan.
+            # We process row-by-row and scroll each row into view first, but we use
+            # a scroll approach that does NOT rely on re-detecting grid rows (which
+            # breaks after toggling cells since unchecked cells lose their SVG checkmarks).
+            clicked = 0
+            cell_lookup = {c["tag"]: c for c in cells}
+
+            for row_idx in range(6):
+                row_tags = {row_idx * 7 + col + 1 for col in range(7)}
+                row_needs_click = row_tags & to_click
+                if not row_needs_click:
+                    continue
+
+                # Scroll the first cell of this row into view using its initial coordinates.
+                # We use window.scrollTo or elementFromPoint to ensure visibility.
+                first_tag = min(row_needs_click)
+                first_cell = cell_lookup[first_tag]
+                js_scroll_to_y = f"""
+(function() {{
+    // Scroll the grid modal so that y={first_cell['y']} is visible
+    var el = document.elementFromPoint({first_cell['x']}, {first_cell['y']});
+    if (el) {{
+        el.scrollIntoView({{behavior: 'instant', block: 'center'}});
+        return JSON.stringify({{ok: true}});
+    }}
+    // Fallback: try scrolling the modal container
+    var weekdaysBtn = null;
+    var allBtns = document.querySelectorAll('button');
+    for (var i = 0; i < allBtns.length; i++) {{
+        if (allBtns[i].textContent.trim() === 'Weekdays') {{ weekdaysBtn = allBtns[i]; break; }}
+    }}
+    if (weekdaysBtn) {{
+        var container = weekdaysBtn;
+        for (var up = 0; up < 12; up++) {{ container = container.parentElement; if (!container) break; }}
+        if (container && container.scrollTo) {{
+            container.scrollTo(0, {max(0, first_cell['y'] - 300)});
+        }}
+    }}
+    return JSON.stringify({{ok: true}});
+}})()
+"""
+                try:
+                    await cdp_client.send.Runtime.evaluate(
+                        params={"expression": js_scroll_to_y, "returnByValue": True, "awaitPromise": True},
+                        session_id=session_id,
+                    )
+                except Exception as scroll_err:
+                    logger.debug("set_schedule_grid: scroll hint for row %d: %s", row_idx, scroll_err)
+
+                await asyncio.sleep(0.15)
+
+                # Re-read coordinates for THIS row's cells after scrolling
+                # Use a simple JS that finds elements at the original x,y or nearby
+                js_refresh_row = f"""
+(function() {{
+    var tags = {list(sorted(row_needs_click))};
+    var origCoords = {json.dumps({{t: {{"x": cell_lookup[t]["x"], "y": cell_lookup[t]["y"]}} for t in sorted(row_needs_click)}})};
+    var result = [];
+    for (var i = 0; i < tags.length; i++) {{
+        var tag = tags[i];
+        var ox = origCoords[tag].x;
+        var oy = origCoords[tag].y;
+        var el = document.elementFromPoint(ox, oy);
+        if (el) {{
+            var rect = el.getBoundingClientRect();
+            result.push({{tag: tag, x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2)}});
+        }} else {{
+            result.push({{tag: tag, x: ox, y: oy}});
+        }}
+    }}
+    return JSON.stringify(result);
+}})()
+"""
+                try:
+                    refresh_result = await cdp_client.send.Runtime.evaluate(
+                        params={"expression": js_refresh_row, "returnByValue": True, "awaitPromise": True},
+                        session_id=session_id,
+                    )
+                    refresh_raw = refresh_result.get("result", {}).get("value", "[]")
+                    refreshed = json.loads(refresh_raw) if isinstance(refresh_raw, str) else refresh_raw
+                    # Update cell_lookup with fresh coords
+                    for rc in refreshed:
+                        if rc["tag"] in cell_lookup:
+                            cell_lookup[rc["tag"]]["x"] = rc["x"]
+                            cell_lookup[rc["tag"]]["y"] = rc["y"]
+                except Exception as refresh_err:
+                    logger.debug("set_schedule_grid: coord refresh for row %d: %s (using original)", row_idx, refresh_err)
+
+                # Click each cell that needs toggling in this row
+                for tag in sorted(row_needs_click):
+                    c = cell_lookup[tag]
+                    action_type = "UNCHECK" if tag in need_uncheck else "CHECK"
+                    logger.info("set_schedule_grid: %s tag %d (%s) at (%d, %d)",
+                                action_type, tag, _tag_label(tag), c["x"], c["y"])
+                    await cdp_click(c["x"], c["y"])
+                    clicked += 1
+
+            # Verify: scroll Save into view, re-read full grid state
+            await asyncio.sleep(0.3)  # let React settle
+
+            # Scroll Save button into view and re-read entire grid
+            js_verify_and_scroll_save = """
+(function() {
+    var weekdaysBtn = null;
+    var allBtns = document.querySelectorAll('button');
+    for (var i = 0; i < allBtns.length; i++) {
+        if (allBtns[i].textContent.trim() === 'Weekdays') { weekdaysBtn = allBtns[i]; break; }
+    }
+    if (!weekdaysBtn) return JSON.stringify({error: 'No Weekdays button'});
+    var container = weekdaysBtn;
+    for (var up = 0; up < 12; up++) { container = container.parentElement; if (!container) break; }
+
+    var rows = [];
+    var candidateRows = container.querySelectorAll('div[class*="StyledInlineChildren"]');
+    for (var r = 0; r < candidateRows.length; r++) {
+        var row = candidateRows[r];
+        if (row.children.length === 7) {
+            var ok = true;
+            for (var c = 0; c < 7; c++) { if (!row.children[c].querySelector('svg')) { ok = false; break; } }
+            if (ok) rows.push(row);
+        }
+    }
+    if (rows.length < 6) {
+        rows = [];
+        var allDivs = container.querySelectorAll('div');
+        for (var d = 0; d < allDivs.length; d++) {
+            var div = allDivs[d];
+            if (div.children.length === 7) {
+                var ok2 = true;
+                for (var c2 = 0; c2 < 7; c2++) { if (!div.children[c2].querySelector('svg')) { ok2 = false; break; } }
+                if (ok2) rows.push(div);
+            }
+        }
+    }
+
+    // Re-read checked state for all cells
+    function isChecked(cellDiv) {
+        var style = window.getComputedStyle(cellDiv);
+        var bg = style.backgroundColor;
+        var innerDiv = cellDiv.querySelector('div');
+        var innerBg = innerDiv ? window.getComputedStyle(innerDiv).backgroundColor : '';
+        function isTealish(color) {
+            if (!color || color === 'rgba(0, 0, 0, 0)' || color === 'transparent') return false;
+            var m = color.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
+            if (!m) return false;
+            var r = parseInt(m[1]), g = parseInt(m[2]), b = parseInt(m[3]);
+            if (r > 240 && g > 240 && b > 240) return false;
+            if (r > 220 && g > 220 && b > 220 && Math.abs(r-g) < 15 && Math.abs(g-b) < 15) return false;
+            return true;
+        }
+        if (isTealish(bg)) return true;
+        if (isTealish(innerBg)) return true;
+        var svg = cellDiv.querySelector('svg');
+        if (svg) {
+            var path = svg.querySelector('path');
+            if (path) {
+                var pathStyle = window.getComputedStyle(path);
+                var stroke = pathStyle.stroke;
+                if (stroke && stroke !== 'none' && stroke !== 'rgba(0, 0, 0, 0)') return true;
+            }
+        }
+        if (cellDiv.getAttribute('aria-checked') === 'true') return true;
+        if (cellDiv.getAttribute('aria-checked') === 'false') return false;
+        return true;
+    }
+
+    var result = {cells: [], saveBtn: null};
+    if (rows.length >= 6) {
+        for (var ri = 0; ri < 6; ri++) {
+            for (var ci = 0; ci < 7; ci++) {
+                var cell = rows[ri].children[ci];
+                result.cells.push({tag: ri * 7 + ci + 1, checked: isChecked(cell)});
+            }
+        }
+    }
+
+    // Scroll Save button into view
+    var modalBtns = container.querySelectorAll('button');
+    for (var j = 0; j < modalBtns.length; j++) {
+        var btnTxt = modalBtns[j].textContent.trim();
+        if (btnTxt === 'Save' || btnTxt === 'Save schedule') {
+            modalBtns[j].scrollIntoView({behavior: 'instant', block: 'center'});
+            var sRect = modalBtns[j].getBoundingClientRect();
+            result.saveBtn = {x: Math.round(sRect.left + sRect.width / 2), y: Math.round(sRect.top + sRect.height / 2)};
+            break;
+        }
+    }
+    return JSON.stringify(result);
+})()
+"""
+            verify_result = await cdp_client.send.Runtime.evaluate(
+                params={"expression": js_verify_and_scroll_save, "returnByValue": True, "awaitPromise": True},
+                session_id=session_id,
+            )
+            verify_raw = verify_result.get("result", {}).get("value", "{}")
+            verify_info = json.loads(verify_raw) if isinstance(verify_raw, str) else verify_raw
+
+            if "cells" in verify_info and verify_info["cells"]:
+                after_checked = {c["tag"] for c in verify_info["cells"] if c.get("checked")}
+                logger.info("set_schedule_grid: AFTER clicks: checked=%s", sorted(after_checked))
+                if after_checked == wanted:
+                    logger.info("set_schedule_grid: VERIFIED — grid matches wanted state perfectly")
+                else:
+                    missing = wanted - after_checked
+                    extra = after_checked - wanted
+                    if missing:
+                        logger.warning("set_schedule_grid: MISMATCH — still unchecked but wanted: %s",
+                                       ", ".join(f"{t}({_tag_label(t)})" for t in sorted(missing)))
+                    if extra:
+                        logger.warning("set_schedule_grid: MISMATCH — still checked but unwanted: %s",
+                                       ", ".join(f"{t}({_tag_label(t)})" for t in sorted(extra)))
+                    # Attempt correction using original cell coordinates
+                    corrections = missing | extra
+                    if corrections and len(corrections) <= 15:
+                        logger.info("set_schedule_grid: CORRECTING %d cells...", len(corrections))
+                        for corr_tag in sorted(corrections):
+                            if corr_tag in cell_lookup:
+                                cc = cell_lookup[corr_tag]
+                                logger.info("set_schedule_grid: CORRECT tag %d (%s) at (%d, %d)",
+                                            corr_tag, _tag_label(corr_tag), cc["x"], cc["y"])
+                                await cdp_click(cc["x"], cc["y"])
+                                clicked += 1
+                        await asyncio.sleep(0.2)
+
+            # Click Save
+            save_clicked = False
+            # Re-read save button position (may have shifted)
+            if verify_info and "saveBtn" in verify_info and verify_info["saveBtn"]:
+                save_btn = verify_info["saveBtn"]
+            if save_btn:
+                await asyncio.sleep(0.2)
+                logger.info("set_schedule_grid: clicking Save at (%d, %d)", save_btn["x"], save_btn["y"])
+                await cdp_click(save_btn["x"], save_btn["y"])
+                save_clicked = True
+                clicked += 1
+
+            actual_toggled = clicked - (1 if save_clicked else 0)  # exclude Save click
+            expected_toggles = len(to_click)
+            if save_clicked and actual_toggled >= expected_toggles:
+                status_word = "SUCCESS"
+            elif save_clicked and actual_toggled > 0:
+                status_word = "PARTIAL"
+            else:
+                status_word = "ERROR"
+            msg = f"{status_word}: {actual_toggled}/{expected_toggles} cells toggled ({len(need_uncheck)} to uncheck, {len(need_check)} to check), {clicked} CDP clicks"
+            if not save_clicked:
+                msg += ". Save button not found — click Save manually."
+            if actual_toggled < expected_toggles:
+                msg += f". WARNING: only {actual_toggled} of {expected_toggles} cells were clicked!"
+            msg += f" wanted={len(wanted)}/42"
+            logger.info("set_schedule_grid: %s", msg)
+            if status_word == "ERROR":
+                return ActionResult(error=msg)
+            return ActionResult(extracted_content=msg)
+        except Exception as e:
+            logger.warning("set_schedule_grid failed: %s", e)
+            return ActionResult(error=f"set_schedule_grid error: {e}")
+
+    return tools
 
 # --- IN USE: Login → Report creation → Report download (Phase 1 of main flow) ---
 def get_task_description_reports_only(
@@ -115,19 +631,14 @@ def get_task_description_campaign_for_subtotal_combo(combo: dict) -> str:
     campaign_name = str(combo.get("campaign_name", f"TODC-{store_id}-${min_subtotal}")).strip() or f"TODC-{store_id}-${min_subtotal}"
     tags_str = ", ".join(str(t) for t in sorted(slot_tags))
 
-    # Grid mapping: tag number → (row_name, col_name) for explicit instructions
-    ALL_TAGS = set(range(1, 43))
+    selected_set = set(slot_tags)
+    all_tags = set(range(1, 43))
+    unselected_set = all_tags - selected_set
+
     _GRID_ROWS = ["Early morning", "Breakfast", "Lunch", "Afternoon", "Dinner", "Late night"]
     _GRID_COLS = ["Mon", "Tue", "Wed", "Thur", "Fri", "Sat", "Sun"]
-    def _tag_to_cell(t: int) -> str:
-        row_idx = (t - 1) // 7
-        col_idx = (t - 1) % 7
-        return f"{_GRID_ROWS[row_idx]}-{_GRID_COLS[col_idx]}"
-
-    selected_set = set(slot_tags)
 
     def _group_by_row(tag_set):
-        """Group tags by row name for systematic processing."""
         rows = {}
         for t in sorted(tag_set):
             row_idx = (t - 1) // 7
@@ -136,131 +647,94 @@ def get_task_description_campaign_for_subtotal_combo(combo: dict) -> str:
             rows.setdefault(row_name, []).append((t, col_name))
         return rows
 
-    # Always: deselect everything first, then select only the needed slots
-    grouped = _group_by_row(selected_set)
-    row_lines = []
-    for row_name, cells in grouped.items():
-        cols = ", ".join(f"{col} (tag {t})" for t, col in cells)
-        row_lines.append(f"  - {row_name} row ({len(cells)} cells): {cols}")
-    grouped_str = "\n".join(row_lines)
-    schedule_instructions = f"""- CRITICAL: Do NOT click any individual grid cells yet.
-- FIRST click "Weekdays" to DESELECT all weekday slots.
-- THEN click "Weekends" to DESELECT all weekend slots.
-- WAIT UNTIL all slots appear deselected (no checkmarks visible in any cell).
-- VERIFY: Every cell in the grid is empty before proceeding. If any cells still have checkmarks, click "Weekdays" and "Weekends" again to toggle them off.
-- Now SELECT (click to check) the following {len(selected_set)} cells, organized by row. Process ONE ROW AT A TIME:
-{grouped_str}
-- IMPORTANT: Click each cell exactly ONCE to select it. Do NOT click any cell more than once or it will toggle back off. Do NOT re-click cells you already selected.
-- After selecting all {len(selected_set)} cells above, verify that exactly {len(selected_set)} cells are checked.
-- COUNT the checked cells in each row to verify: {', '.join(f'{row}: {sum(1 for t in selected_set if (t-1)//7 == i)}' for i, row in enumerate(_GRID_ROWS) if sum(1 for t in selected_set if (t-1)//7 == i) > 0)}."""
+    # Build fallback manual instructions (used ONLY if set_schedule_grid fails twice)
+    if len(selected_set) == 42:
+        manual_fallback = "All 42 cells should already be selected. Just click Save."
+    elif len(unselected_set) <= 20:
+        grouped = _group_by_row(unselected_set)
+        lines = []
+        for row_name, cells in grouped.items():
+            cols = ", ".join(col for _, col in cells)
+            lines.append(f"  - {row_name} row: click {cols}")
+        manual_fallback = f"DESELECT these {len(unselected_set)} cells (click each ONCE):\n" + "\n".join(lines) + "\n  Then click Save."
+    else:
+        grouped = _group_by_row(selected_set)
+        lines = []
+        for row_name, cells in grouped.items():
+            cols = ", ".join(col for _, col in cells)
+            lines.append(f"  - {row_name} row: click {cols}")
+        manual_fallback = (
+            f"Click Weekdays ONCE, then Weekends ONCE (grid now empty). "
+            f"Then SELECT these {len(selected_set)} cells (click each ONCE):\n"
+            + "\n".join(lines)
+            + "\n  Then click Save. NEVER click Weekdays/Weekends again."
+        )
+
+    schedule_instructions = f"""- IMPORTANT: Use the set_schedule_grid action to configure the grid automatically.
+- Call: set_schedule_grid(wanted_tags="{tags_str}")
+- This action programmatically checks/unchecks the correct cells and clicks Save. It is 100% reliable.
+- Do NOT manually click any grid cells, "Weekdays", or "Weekends" buttons. The action handles everything.
+- If set_schedule_grid returns SUCCESS, proceed to STEP 4B immediately.
+- If set_schedule_grid returns PARTIAL (Save not found), click "Save" manually once, then proceed to STEP 4B.
+- If set_schedule_grid returns ERROR twice, do it manually: {manual_fallback}"""
 
     return f"""
 ROLE: You are automating campaign creation on DoorDash Merchant Portal. You are already logged in.
 
-HARD RULES (read before every action):
-- Do NOT go to the login page.
-- Do NOT create reports or download anything.
+RULES:
+- Do NOT go to the login page or create/download reports.
 - Do NOT click "Get started" (that is for BOGO, not discount campaigns).
-- Do NOT click "Create promotion" until step 7 explicitly says to.
-- Do NOT click any button not mentioned in the steps below.
-- If a modal does not open after clicking Edit, wait 3 seconds, scroll to make the section visible, then click Edit again ONCE. If it still fails, go to sidebar > Marketing > Run a campaign and restart from step 1.
+- Do NOT click "Create promotion" until step 6 explicitly says to.
+- If a modal fails to open after clicking Edit, wait 3s, scroll to make section visible, click Edit again ONCE.
 
-CAMPAIGN: {campaign_name}
-STORE ID: {store_id}
-STORE NAME: {store_name if store_name else "N/A"}
-MIN SUBTOTAL: ${min_subtotal}
-SCHEDULE TAGS: {tags_str}
+CAMPAIGN: {campaign_name} | STORE: {store_id} ({store_name if store_name else "N/A"}) | SUBTOTAL: ${min_subtotal} | TAGS: {tags_str}
 
 STEP 1 — Open campaign builder:
-- Click "Marketing" in the left sidebar.
-- WAIT UNTIL the Marketing page has fully loaded (look for page content to appear, not just a spinner).
-- Click "Run a campaign".
-- WAIT UNTIL you see campaign type cards on the page. If after 10 seconds you don't see them, scroll down or click "Run a campaign" again.
-- VERIFY: You see campaign type cards on the page.
-- Find "Discount for all customers" card. Click its "Select" button.
-- WAIT UNTIL a right-side panel appears. VERIFY: A right-side panel is visible.
-- Click "Customize your campaign" in that panel.
-- WAIT UNTIL the campaign customization form loads.
+- Click "Marketing" in the left sidebar. Wait for page to load.
+- Click "Run a campaign". Wait for campaign type cards.
+- Find "Discount for all customers" card, click "Select".
+- Click "Customize your campaign" in the right panel. Wait for form to load.
 
 STEP 2 — Select store:
-- Click the Edit (pencil) icon next to "Stores".
-- WAIT UNTIL the Store selection modal is fully open and interactive.
-- VERIFY: Store selection modal is open. If not, wait a moment and click Edit again.
+- Click Edit (pencil) next to "Stores". Wait for modal.
 - Click "Select All" to deselect all stores.
-- WAIT UNTIL all checkboxes are deselected.
-- Type "{store_id}" in the search bar.
-- WAIT UNTIL search results appear.
-- If a store matching "{store_id}" appears in the results, select it.
-- FALLBACK: If NO store appears for "{store_id}" (empty results or "no results found"), clear the search bar and type the store name "{store_name}" instead. WAIT UNTIL search results appear. Select the store matching "{store_name}".
-- Select ONLY one store (the one matching the Store ID or Store Name above).
-- Click "Save".
-- WAIT UNTIL the modal closes and the store selection is saved.
+- Search "{store_id}" in search bar. If found, select it. If NOT found, search "{store_name}" instead.
+- Select ONLY the one matching store. Click "Save".
 
 STEP 3 — Set customer incentive:
-- Scroll the right panel until "Customer incentive" heading is visible.
-- Click the Edit (pencil) icon that is DIRECTLY next to "Customer incentive" text.
-- WAIT UNTIL the incentive modal is fully loaded.
-- VERIFY: Modal title says "Set customer incentive". If not, do NOT proceed — wait 3 seconds, then retry the click once. If still wrong, navigate to sidebar > Marketing > Run a campaign and restart from step 1.
+- Click Edit (pencil) next to "Customer incentive". Wait for modal.
 - Click "15%" radio button.
-- WAIT UNTIL the radio button is selected.
-- Click "Custom" under Minimum subtotal.
-- WAIT UNTIL the custom subtotal input field appears.
-- Click DIRECTLY on the custom subtotal INPUT FIELD (not the "Custom" button) to focus it.
-- Select all text in the field (triple-click or Ctrl+A / Cmd+A).
-- Type: {min_subtotal}
-- WAIT 2 seconds for the field to update.
-- VERIFY the field now displays "{min_subtotal}" or "${min_subtotal}". READ the actual value shown in the input field.
-- If the field is EMPTY or shows a DIFFERENT value (like "$25" which is the default), you MUST fix it:
-  1. Click the input field again to focus it.
-  2. Triple-click to select all existing text.
-  3. Type {min_subtotal} again.
-  4. WAIT 2 seconds and re-verify.
-- Do NOT proceed until the field shows {min_subtotal} or ${min_subtotal}. The default value of $25 is WRONG unless the target is exactly $25.
-- Find "Maximum discount amount" section (three buttons like $5, $7, $10 or similar).
-- Click the LEFTMOST button (smallest value, typically $5 or $2).
-- VERIFY: The leftmost button appears selected/highlighted.
+- Click "Custom" under Minimum subtotal. Click the input field.
+- Select all text (triple-click), type: {min_subtotal}
+- Wait 2s. VERIFY field shows {min_subtotal} or ${min_subtotal}. If it shows $25 or wrong value, clear and retype.
+- Click LEFTMOST button under "Maximum discount amount" (smallest value).
 - Click "Save".
-- WAIT UNTIL the modal closes.
 
 STEP 4 — Set schedule:
-- Click the Edit (pencil) icon next to "Scheduling".
-- WAIT UNTIL the Scheduling modal is fully open with a grid visible.
-- VERIFY: Scheduling modal is open with a grid. If not, wait and retry.
-- Click "Set a custom schedule".
-- WAIT UNTIL the custom schedule grid is visible.
-- Grid layout: 6 rows (Early morning, Breakfast, Lunch, Afternoon, Dinner, Late night) x 7 columns (Mon, Tue, Wed, Thur, Fri, Sat, Sun).
+- Click Edit (pencil) next to "Scheduling". Wait for modal with grid.
+- Click "Set a custom schedule". Wait for grid.
+- Grid: 6 rows (Early morning, Breakfast, Lunch, Afternoon, Dinner, Late night) x 7 cols (Mon-Sun).
 {schedule_instructions}
-- Click "Save".
-- WAIT UNTIL the modal closes and the schedule is saved.
 
-STEP 5 — Verify incentive (MANDATORY safety check):
-- Click Edit (pencil) next to "Customer incentive" again.
-- WAIT UNTIL the modal opens.
-- READ the current Minimum subtotal value displayed in the field. It MUST show {min_subtotal} or ${min_subtotal}.
-- If it shows $25 (the default) or ANY value other than ${min_subtotal}, it is WRONG and you MUST fix it:
-  1. Click "Custom" under Minimum subtotal.
-  2. Click the input field to focus it.
-  3. Triple-click to select all text, then type: {min_subtotal}
-  4. WAIT 2 seconds and verify the field shows {min_subtotal} or ${min_subtotal}.
-- Confirm the leftmost Maximum discount button is selected. If not, click it.
+STEP 4B — Re-confirm Maximum discount amount (MANDATORY after schedule):
+- Click Edit (pencil) next to "Customer incentive". Wait for modal to open.
+- Look at the "Maximum discount amount" section. Click the LEFTMOST (smallest/lowest) value button.
 - Click "Save".
-- WAIT UNTIL the modal closes.
-- VERIFY: The campaign summary/panel should show "orders ${min_subtotal} or more" (NOT $25 unless target is $25). If it shows the wrong value, go back to STEP 5 and fix it.
+- This step is REQUIRED because DoorDash may change available max discount options after the schedule is modified.
 
-STEP 6 — Set campaign name:
+STEP 5 — Set campaign name:
 - Click Edit (pencil) next to "Campaign name".
-- WAIT UNTIL the name editing field is visible and editable.
-- Clear ALL existing text in the name field.
-- Type exactly: {campaign_name}
+- Clear all text, type exactly: {campaign_name}
 - Click "Save".
-- WAIT UNTIL the modal closes.
-- VERIFY: The campaign name shows as "{campaign_name}".
 
-STEP 7 — Create the promotion:
-- ONLY now click "Create promotion" at the bottom.
-- WAIT UNTIL you see confirmation that the campaign was created (a success message, toast, or redirect).
+STEP 6 — Final verify and create (do NOT skip):
+- BEFORE clicking "Create promotion", read the campaign summary panel:
+  - Confirm it shows "${min_subtotal}" (not $25 unless target is $25). If wrong, click Edit next to "Customer incentive", fix it, Save.
+  - Confirm campaign name shows "{campaign_name}".
+- Click "Create promotion". Wait for success confirmation.
+- IMPORTANT: If you see a message like "The details of this campaign are the same as one of your live campaigns" or any duplication warning, do NOT try to fix it. Just use the done action immediately and say: "{campaign_name}" DUPLICATE for store {store_id}.
 
-DONE: Use the done action. Summarize: campaign "{campaign_name}" created for store {store_id}.
+DONE: Use done action. Say: "{campaign_name}" created for store {store_id}.
 """
 
 
@@ -280,20 +754,42 @@ def _get_llm():
 
 
 def _get_browser(download_dir: Path, keep_alive: bool = False):
-    """Browser with download path set to the given directory. keep_alive=True keeps browser open for reuse."""
+    """
+    Browser with download path set to the given directory.
+    keep_alive=True keeps browser open for reuse.
+
+    Connection priority:
+      1. LOCAL_BROWSER_CDP_URL — Remote headless Chrome via CDP (GCP/cloud deployment)
+      2. Local Chrome executable (macOS laptop)
+      3. Default browser-use browser
+    """
     from browser_use import Browser
 
     downloads_path = str(download_dir.resolve())
+
+    # --- Remote CDP (headless Chrome on GCP VM, Browserless, etc.) ---
+    cdp_url = os.getenv("LOCAL_BROWSER_CDP_URL", "").strip()
+    if cdp_url:
+        logger.info("Connecting to remote Chrome via CDP: %s", cdp_url)
+        return Browser(
+            cdp_url=cdp_url,
+            downloads_path=downloads_path,
+            enable_default_extensions=False,
+            keep_alive=keep_alive,
+        )
+
+    # --- Local Chrome executable (laptop/macOS) ---
     common = dict(
         downloads_path=downloads_path,
         enable_default_extensions=False,
         keep_alive=keep_alive,
     )
-    # Optional: use Chrome executable on macOS for consistent behavior
     if os.name == "posix":
         chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
         if Path(chrome).exists():
             return Browser(executable_path=chrome, **common)
+
+    # --- Default browser-use browser ---
     return Browser(**common)
 
 
@@ -436,11 +932,15 @@ async def run_reports_then_analysis_then_campaign(
     start_date: str,
     end_date: str,
     analysis_callback: Callable[[Optional[Path], Optional[Path]], Awaitable[Optional[Path]]],
+    campaigns_only_combined_path: Optional[Path] = None,
 ) -> None:
     """
     Single browser session: login → reports → download → (browser stays open) →
     run analysis_callback(marketing_path, financial_path) → returns combined_path →
     for each (store, day, slot) combo from combined_analysis Day-Slot sheets, run campaign (no login again) → close browser.
+
+    If campaigns_only_combined_path is provided, skip Phase 1 (reports) and analysis entirely.
+    Just login and run campaigns from the existing combined analysis file.
 
     Store IDs come only from the logged-in account's combined_analysis sheets ("Day-Slot - {StoreID}"). No env store IDs.
     """
@@ -464,115 +964,207 @@ async def run_reports_then_analysis_then_campaign(
     slots_csv_path = project_root / "slots.csv"
     download_dir.mkdir(parents=True, exist_ok=True)
 
-    reports_task = get_task_description_reports_only(
-        email=email,
-        password=password,
-        start_date=start_date,
-        end_date=end_date,
-    )
-
     llm = _get_llm()
     browser = _get_browser(download_dir, keep_alive=True)
-    agent = Agent(task=reports_task, llm=llm, browser=browser)
 
-    logger.info("DoorDash (browser-use): Phase 1 — reports (login, create, download); browser will stay open.")
-    try:
-        await asyncio.wait_for(agent.run(), timeout=AGENT_REPORTS_TIMEOUT)
-        push_to_slack(f"Login successful for {email}")
-    except asyncio.TimeoutError:
-        await _kill_browser(browser)
-        push_to_slack(f"Phase 1 timed out after {AGENT_REPORTS_TIMEOUT}s for {email}")
-        raise RuntimeError(f"Phase 1 (reports) timed out after {AGENT_REPORTS_TIMEOUT}s")
-    except Exception as e:
-        await _kill_browser(browser)
-        push_to_slack(f"Login failed for {email}: {e}")
-        raise e
-
-    marketing_path, financial_path = _discover_downloads(download_dir)
-
-    # --- Retry: if one report is missing, attempt to download just the missing one ---
-    if not financial_path or not marketing_path:
-        missing = []
-        if not financial_path:
-            missing.append("Financial")
-        if not marketing_path:
-            missing.append("Marketing")
-        logger.warning("DoorDash (browser-use): Missing report(s) after Phase 1: %s. Retrying download.", ", ".join(missing))
-        push_to_slack(f"Missing report(s): {', '.join(missing)}. Retrying download...")
-
-        retry_task = _get_retry_download_task(missing)
-        retry_agent = Agent(task=retry_task, llm=llm, browser=browser)
-        try:
-            await asyncio.wait_for(retry_agent.run(), timeout=300)  # 5 min retry
-            marketing_path, financial_path = _discover_downloads(download_dir)
-            logger.info("DoorDash (browser-use): After retry — financial=%s, marketing=%s", financial_path, marketing_path)
-        except Exception as retry_err:
-            logger.warning("DoorDash (browser-use): Retry download failed: %s", retry_err)
-
-    if financial_path:
-        logger.info("DoorDash (browser-use): Financial report at %s", financial_path)
-        push_to_slack("Financials Report pulled")
-    else:
-        push_to_slack("Financials Report failed: file not found after retry")
-
-    if marketing_path:
-        logger.info("DoorDash (browser-use): Marketing report at %s", marketing_path)
-        push_to_slack("Marketing report pulled")
-    else:
-        push_to_slack("Marketing report failed: file not found after retry")
-
-    if financial_path and marketing_path:
-        push_to_slack("Reports downloaded")
-
-    logger.info("DoorDash (browser-use): Pausing browser agent; running analysis callback.")
-    combined_path = await analysis_callback(marketing_path, financial_path)
-
-    if not combined_path or not Path(combined_path).is_file():
-        logger.warning(
-            "DoorDash (browser-use): No combined_analysis file returned. Set DOORDASH_* credentials and ensure financial/marketing analysis run; campaigns will use fallback env only if set."
+    # --- CAMPAIGNS-ONLY MODE: skip reports & analysis, just login and run campaigns ---
+    if campaigns_only_combined_path and Path(campaigns_only_combined_path).is_file():
+        combined_path = Path(campaigns_only_combined_path)
+        logger.info("=" * 70)
+        logger.info("CAMPAIGNS-ONLY MODE — skipping reports & analysis")
+        logger.info("  Email: %s", email)
+        logger.info("  Combined analysis: %s", combined_path)
+        logger.info("  Download dir: %s", download_dir)
+        logger.info("=" * 70)
+        push_to_slack(
+            f"*Campaigns-only mode* — skipping reports & analysis\n"
+            f"Email: {email}\n"
+            f"Using: {combined_path.name}"
         )
+
+        # Login only
+        login_task = (
+            f"Go to https://merchant-portal.doordash.com/merchant/login\n"
+            f"Enter email: {email}, click 'Continue to Log In'.\n"
+            f"On the next screen, enter password: {password}, click 'Log In'.\n"
+            f"Wait for the dashboard to load. Use done action to finish."
+        )
+        try:
+            login_agent = Agent(task=login_task, llm=llm, browser=browser)
+            await asyncio.wait_for(login_agent.run(), timeout=AGENT_LOGIN_TIMEOUT)
+            logger.info("Login successful")
+            push_to_slack(f"Login successful for {email}")
+        except Exception as e:
+            await _kill_browser(browser)
+            push_to_slack(f"*FAILED* — Login failed for {email}: {e}")
+            raise e
+
+        # Read combos from Campaign Mappings, skip Successful ones
+        all_combos = read_campaign_combos_from_mappings(combined_path)
+        if not all_combos:
+            logger.warning("No campaign mappings found in %s", combined_path)
+            await _kill_browser(browser)
+            return
+        before = len(all_combos)
+        combos = [c for c in all_combos if c.get("status") != "Successful"]
+        skipped = before - len(combos)
+        use_slots_csv = False
+        logger.info(
+            "DoorDash: %d campaign mappings; %d already Successful, %d remaining.",
+            before, skipped, len(combos),
+        )
+        push_to_slack(f"Resuming: {skipped} Successful (skipped), {len(combos)} to run")
+
     else:
-        push_to_slack("Combined analysis formed")
+        # --- FULL MODE: Login → Reports → Analysis → Campaigns ---
+        reports_task = get_task_description_reports_only(
+            email=email,
+            password=password,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
-    combos = []
-    use_slots_csv = False
-    if get_campaign_combos_from_slots_and_combined and slots_csv_path.is_file() and combined_path and Path(combined_path).is_file():
-        combos = get_campaign_combos_from_slots_and_combined(slots_csv_path, Path(combined_path))
-        if combos:
-            use_slots_csv = True
-            logger.info("DoorDash (browser-use): Found %s campaign combos from Day-Slot sheets + slots grid (one per min_subtotal per store).", len(combos))
-    if not combos and combined_path and Path(combined_path).is_file() and get_all_campaign_combos_from_combined_analysis:
-        combos = get_all_campaign_combos_from_combined_analysis(Path(combined_path))
-        logger.info("DoorDash (browser-use): Found %s campaign combos from Day-Slot sheets (store IDs from sheets).", len(combos))
+        agent = Agent(task=reports_task, llm=llm, browser=browser)
 
-    # Push campaign mappings to combined analysis sheet (one row per combo)
-    if combined_path and Path(combined_path).is_file() and combos:
-        mappings = []
-        for c in combos:
-            # Support both legacy (day, slot) and subtotal-based (slot_tags) combo shape
-            slot_tags = c.get("slot_tags")
-            if slot_tags is None and c.get("day") and c.get("slot"):
-                slot_tags = [f"{c.get('day', '')}-{c.get('slot', '')}"]
-            mappings.append({
-                "store_id": c.get("store_id", ""),
-                "store_name": c.get("store_name", ""),
-                "min_subtotal": c.get("min_subtotal", 10),
-                "slot_tags": slot_tags or [],
-                "campaign_name": c.get("campaign_name", ""),
-            })
-        append_campaign_mappings_to_workbook(Path(combined_path), mappings)
+        logger.info("=" * 70)
+        logger.info("PHASE 1: LOGIN + REPORTS (login, create financial & marketing, download)")
+        logger.info("  Email: %s", email)
+        logger.info("  Date range: %s to %s", start_date, end_date)
+        logger.info("  Download dir: %s", download_dir)
+        logger.info("=" * 70)
+        push_to_slack(
+            f"*Phase 1 started* — Login + Reports\n"
+            f"Email: {email}\n"
+            f"Date range: {start_date} to {end_date}"
+        )
+        phase1_start = time.time()
+        try:
+            await asyncio.wait_for(agent.run(), timeout=AGENT_REPORTS_TIMEOUT)
+            phase1_elapsed = time.time() - phase1_start
+            logger.info("Phase 1: Login + reports completed in %.0fs", phase1_elapsed)
+            push_to_slack(f"Login successful for {email} ({phase1_elapsed:.0f}s)")
+        except asyncio.TimeoutError:
+            await _kill_browser(browser)
+            push_to_slack(f"*FAILED* — Phase 1 timed out after {AGENT_REPORTS_TIMEOUT}s for {email}")
+            raise RuntimeError(f"Phase 1 (reports) timed out after {AGENT_REPORTS_TIMEOUT}s")
+        except Exception as e:
+            await _kill_browser(browser)
+            push_to_slack(f"*FAILED* — Login failed for {email}: {e}")
+            raise e
 
-        # Skip campaigns already marked Successful in the sheet (resume after partial run)
-        existing_statuses = read_campaign_mapping_statuses(Path(combined_path))
-        already_done = {name for name, s in existing_statuses.items() if s == "Successful"}
-        if already_done:
-            before = len(combos)
-            combos = [c for c in combos if c.get("campaign_name") not in already_done]
-            logger.info(
-                "DoorDash: skipping %d already-Successful campaign(s); %d remaining.",
-                before - len(combos), len(combos),
-            )
-            push_to_slack(f"Resuming: {before - len(combos)} campaigns already done, {len(combos)} remaining")
+        marketing_path, financial_path = _discover_downloads(download_dir)
+
+        # --- Retry: if one report is missing, attempt to download just the missing one ---
+        if not financial_path or not marketing_path:
+            missing = []
+            if not financial_path:
+                missing.append("Financial")
+            if not marketing_path:
+                missing.append("Marketing")
+            logger.warning("DoorDash (browser-use): Missing report(s) after Phase 1: %s. Retrying download.", ", ".join(missing))
+            push_to_slack(f"Missing report(s): {', '.join(missing)}. Retrying download...")
+
+            retry_task = _get_retry_download_task(missing)
+            retry_agent = Agent(task=retry_task, llm=llm, browser=browser)
+            try:
+                await asyncio.wait_for(retry_agent.run(), timeout=300)  # 5 min retry
+                marketing_path, financial_path = _discover_downloads(download_dir)
+                logger.info("DoorDash (browser-use): After retry — financial=%s, marketing=%s", financial_path, marketing_path)
+            except Exception as retry_err:
+                logger.warning("DoorDash (browser-use): Retry download failed: %s", retry_err)
+
+        if financial_path:
+            logger.info("DoorDash (browser-use): Financial report at %s", financial_path)
+            push_to_slack("Financials Report pulled")
+        else:
+            push_to_slack("Financials Report failed: file not found after retry")
+
+        if marketing_path:
+            logger.info("DoorDash (browser-use): Marketing report at %s", marketing_path)
+            push_to_slack("Marketing report pulled")
+        else:
+            push_to_slack("Marketing report failed: file not found after retry")
+
+        if financial_path and marketing_path:
+            push_to_slack("Reports downloaded")
+
+        # --- Find previous combined analysis from sibling run folders ---
+        _all_combined: list[Path] = []
+        _dir_name = download_dir.name
+        _prefix_match = re.match(r"^(.+)-\d{8}_\d{6}$", _dir_name)
+        if _prefix_match:
+            _email_prefix = _prefix_match.group(1)
+            for sibling in download_dir.parent.glob(f"{_email_prefix}-*"):
+                if sibling == download_dir:
+                    continue
+                _all_combined.extend(sibling.glob("combined_analysis_*.xlsx"))
+        _all_combined.extend(download_dir.glob("combined_analysis_*.xlsx"))
+        old_combined_files = sorted(_all_combined, key=lambda f: f.parent.name, reverse=True)
+        if old_combined_files:
+            logger.info("Found previous combined analysis: %s", old_combined_files[0])
+
+        logger.info("=" * 70)
+        logger.info("ANALYSIS PHASE: Financial + Marketing analysis, combined report, Google Sheets")
+        logger.info("=" * 70)
+        push_to_slack("*Analysis phase started* — Processing downloaded reports...")
+        analysis_start = time.time()
+        combined_path = await analysis_callback(marketing_path, financial_path)
+        analysis_elapsed = time.time() - analysis_start
+        logger.info("Analysis phase completed in %.0fs", analysis_elapsed)
+
+        if not combined_path or not Path(combined_path).is_file():
+            logger.warning("No combined_analysis file returned — campaigns will have no slot data")
+            push_to_slack("*Warning:* Combined analysis not created — check financial/marketing report paths")
+        else:
+            push_to_slack(f"Combined analysis created ({analysis_elapsed:.0f}s) — {combined_path}")
+
+        # --- Copy Campaign Mappings from previous run if available, then run non-Successful ones ---
+        combos = []
+        use_slots_csv = False
+        copied_from_previous = False
+
+        if old_combined_files and combined_path and Path(combined_path).is_file():
+            copied = copy_campaign_mappings_from_previous(old_combined_files[0], Path(combined_path))
+            if copied:
+                all_combos = read_campaign_combos_from_mappings(Path(combined_path))
+                if all_combos:
+                    copied_from_previous = True
+                    before = len(all_combos)
+                    combos = [c for c in all_combos if c.get("status") != "Successful"]
+                    skipped = before - len(combos)
+                    logger.info(
+                        "DoorDash: Copied %d campaign mappings from previous run; %d already Successful, %d remaining.",
+                        before, skipped, len(combos),
+                    )
+                    if skipped:
+                        push_to_slack(f"Resuming: {skipped} campaigns already Successful, {len(combos)} remaining")
+
+        # Fallback: build combos from Day-Slot sheets if no previous Campaign Mappings available
+        if not copied_from_previous:
+            if get_campaign_combos_from_slots_and_combined and slots_csv_path.is_file() and combined_path and Path(combined_path).is_file():
+                combos = get_campaign_combos_from_slots_and_combined(slots_csv_path, Path(combined_path))
+                if combos:
+                    use_slots_csv = True
+                    logger.info("DoorDash (browser-use): Found %s campaign combos from Day-Slot sheets + slots grid (one per min_subtotal per store).", len(combos))
+            if not combos and combined_path and Path(combined_path).is_file() and get_all_campaign_combos_from_combined_analysis:
+                combos = get_all_campaign_combos_from_combined_analysis(Path(combined_path))
+                logger.info("DoorDash (browser-use): Found %s campaign combos from Day-Slot sheets (store IDs from sheets).", len(combos))
+
+            # Push fresh campaign mappings to combined analysis sheet
+            if combined_path and Path(combined_path).is_file() and combos:
+                mappings = []
+                for c in combos:
+                    slot_tags = c.get("slot_tags")
+                    if slot_tags is None and c.get("day") and c.get("slot"):
+                        slot_tags = [f"{c.get('day', '')}-{c.get('slot', '')}"]
+                    mappings.append({
+                        "store_id": c.get("store_id", ""),
+                        "store_name": c.get("store_name", ""),
+                        "min_subtotal": c.get("min_subtotal", 10),
+                        "slot_tags": slot_tags or [],
+                        "campaign_name": c.get("campaign_name", ""),
+                    })
+                append_campaign_mappings_to_workbook(Path(combined_path), mappings)
 
     # Template for re-login after browser restart
     relogin_task = (
@@ -596,41 +1188,59 @@ async def run_reports_then_analysis_then_campaign(
     if combos:
         if ensure_campaigns_executed_csv:
             ensure_campaigns_executed_csv(download_dir)
-        logger.info(
-            "DoorDash (browser-use): Phase 2 — %s campaigns from %s (fresh Agent context per campaign).",
-            len(combos),
-            "slots.csv" if use_slots_csv else "combined_analysis",
+
+        total = len(combos)
+        logger.info("=" * 70)
+        logger.info("PHASE 2: CAMPAIGN CREATION — %s campaigns to create", total)
+        logger.info("Source: %s | Browser restart every %s campaigns", "slots.csv" if use_slots_csv else "combined_analysis", MAX_CAMPAIGNS_PER_SESSION)
+        logger.info("=" * 70)
+        push_to_slack(
+            f"*Phase 2 started* — {total} campaigns to create\n"
+            f"Source: {'slots.csv' if use_slots_csv else 'combined_analysis'} | "
+            f"Timeout: {AGENT_CAMPAIGN_TIMEOUT}s/campaign | Browser restart every {MAX_CAMPAIGNS_PER_SESSION}"
         )
+
+        # Tracking stats
+        phase2_start = time.time()
+        stats = {"successful": 0, "failed": 0, "skipped": 0, "timed_out": 0}
+        campaign_times: list[float] = []
+
         for i, combo in enumerate(combos, 1):
-            # Restart browser every N campaigns to prevent browser memory growth
+            campaign_start = time.time()
+
+            # --- Browser restart every N campaigns ---
             if i > 1 and (i - 1) % MAX_CAMPAIGNS_PER_SESSION == 0:
-                logger.info("Restarting browser after %d campaigns to prevent memory growth", i - 1)
+                logger.info("--- Browser restart after %d campaigns (session limit: %d) ---", i - 1, MAX_CAMPAIGNS_PER_SESSION)
                 await _kill_browser(browser)
                 browser = _get_browser(download_dir, keep_alive=True)
                 relogin_ok = False
-                for relogin_attempt in range(1, 3):  # 2 attempts to re-login
+                for relogin_attempt in range(1, 3):
                     try:
                         login_agent = Agent(task=relogin_task, llm=llm, browser=browser)
                         await asyncio.wait_for(login_agent.run(), timeout=AGENT_LOGIN_TIMEOUT)
-                        push_to_slack(f"Browser restarted after {i - 1} campaigns, re-logged in")
+                        logger.info("--- Re-login successful (attempt %d) ---", relogin_attempt)
                         relogin_ok = True
                         break
                     except asyncio.TimeoutError:
-                        logger.warning("Re-login attempt %d timed out", relogin_attempt)
+                        logger.warning("--- Re-login attempt %d timed out ---", relogin_attempt)
                         await _kill_browser(browser)
                         browser = _get_browser(download_dir, keep_alive=True)
                     except Exception as e:
-                        logger.warning("Re-login attempt %d failed: %s", relogin_attempt, e)
+                        logger.warning("--- Re-login attempt %d failed: %s ---", relogin_attempt, e)
                         await _kill_browser(browser)
                         browser = _get_browser(download_dir, keep_alive=True)
                 if not relogin_ok:
-                    push_to_slack(f"Re-login failed after browser restart at campaign {i}; aborting remaining campaigns")
-                    logger.error("Re-login failed after 2 attempts; stopping campaign loop to avoid running on dead browser")
+                    elapsed = time.time() - phase2_start
+                    push_to_slack(
+                        f"*ABORTED* — Re-login failed at campaign {i}/{total}\n"
+                        f"Completed: {stats['successful']} ok, {stats['failed']} failed, {stats['skipped']} skipped\n"
+                        f"Time elapsed: {elapsed/60:.0f} min"
+                    )
+                    logger.error("Re-login failed after 2 attempts; stopping campaign loop")
                     await _kill_browser(browser)
                     return
 
-            # Fresh Agent for navigation reset — clean LLM context, same browser session
-            # Navigate to a fresh URL first to clear any stale DOM/JS state from previous campaign
+            # --- Navigation reset ---
             nav_to_marketing_task = (
                 "Go to this URL: https://merchant-portal.doordash.com/merchant/marketing "
                 "WAIT UNTIL the page has fully loaded. "
@@ -641,30 +1251,65 @@ async def run_reports_then_analysis_then_campaign(
                 reset_agent = Agent(task=nav_to_marketing_task, llm=llm, browser=browser)
                 await asyncio.wait_for(reset_agent.run(), timeout=AGENT_RESET_TIMEOUT)
             except asyncio.TimeoutError:
-                logger.warning("Navigation reset timed out before campaign %s; attempting fallback reset", i)
-                # Fallback: try the sidebar-click method
+                logger.warning("[%d/%d] Nav reset timed out; trying sidebar fallback", i, total)
                 try:
                     fallback_agent = Agent(task=reset_task, llm=llm, browser=browser)
                     await asyncio.wait_for(fallback_agent.run(), timeout=AGENT_RESET_TIMEOUT)
                 except Exception:
-                    logger.warning("Fallback navigation reset also failed before campaign %s", i)
+                    logger.warning("[%d/%d] Sidebar fallback also failed", i, total)
             except Exception as e:
-                logger.warning("Navigation reset failed before campaign %s: %s; continuing", i, e)
+                logger.warning("[%d/%d] Nav reset failed: %s; continuing", i, total, e)
 
+            # --- Health check every 5 campaigns (not on restart boundaries) ---
+            if i > 1 and (i - 1) % MAX_CAMPAIGNS_PER_SESSION != 0 and (i - 1) % 5 == 0:
+                try:
+                    health_agent = Agent(
+                        task="Check if the DoorDash Merchant Portal page is loaded and interactive. "
+                             "Look for sidebar navigation, page content, or any visible UI elements. "
+                             "If the page is blank, showing only a spinner, or unresponsive, say 'PAGE_BLANK'. "
+                             "Otherwise say 'PAGE_OK'. Use the done action.",
+                        llm=llm, browser=browser,
+                    )
+                    health_history = await asyncio.wait_for(health_agent.run(), timeout=30)
+                    health_result = ""
+                    if health_history and hasattr(health_history, "final_result"):
+                        val = health_history.final_result
+                        health_result = str(val() if callable(val) else val) if val is not None else ""
+                    if "PAGE_BLANK" in health_result.upper():
+                        logger.warning("[%d/%d] Health check: page blank — restarting browser", i, total)
+                        await _kill_browser(browser)
+                        browser = _get_browser(download_dir, keep_alive=True)
+                        login_agent = Agent(task=relogin_task, llm=llm, browser=browser)
+                        await asyncio.wait_for(login_agent.run(), timeout=AGENT_LOGIN_TIMEOUT)
+                        push_to_slack(f"Browser auto-restarted (blank page detected) before campaign {i}/{total}")
+                        reset_agent = Agent(task=nav_to_marketing_task, llm=llm, browser=browser)
+                        await asyncio.wait_for(reset_agent.run(), timeout=AGENT_RESET_TIMEOUT)
+                except Exception as health_err:
+                    logger.debug("Health check error (non-fatal): %s", health_err)
+
+            # --- Campaign details ---
             campaign_name = str(combo.get("campaign_name", ""))
             store_id = str(combo.get("store_id", ""))
             min_subtotal = str(combo.get("min_subtotal", "10"))
-            if combo.get("day") and combo.get("slot"):
-                detail = f"store {store_id}, {combo.get('day')}, {combo.get('slot')}, min_subtotal ${min_subtotal}"
-            else:
-                detail = f"store {store_id}, min_subtotal ${min_subtotal}"
-            push_to_slack(f"{campaign_name} setup in progress — {detail}")
+            slot_count = len(combo.get("slot_tags", []))
 
-            # Fresh Agent per campaign — LLM context never carries previous campaign history
+            # Progress calculation
+            pct = (i / total) * 100
+            avg_time = sum(campaign_times) / len(campaign_times) if campaign_times else 0
+            eta_sec = avg_time * (total - i) if campaign_times else 0
+            eta_str = f"{eta_sec/60:.0f}m" if eta_sec > 0 else "calculating..."
+
+            logger.info(
+                "[%d/%d] (%.0f%%) %s — store %s, $%s, %d slots | ETA: %s",
+                i, total, pct, campaign_name, store_id, min_subtotal, slot_count, eta_str,
+            )
+
+            # --- Run campaign agent ---
             campaign_task = get_task_description_campaign_for_subtotal_combo(combo)
             status = "Failed"
             try:
-                campaign_agent = Agent(task=campaign_task, llm=llm, browser=browser)
+                campaign_tools = _build_campaign_tools()
+                campaign_agent = Agent(task=campaign_task, llm=llm, browser=browser, tools=campaign_tools)
                 history = await asyncio.wait_for(campaign_agent.run(), timeout=AGENT_CAMPAIGN_TIMEOUT)
                 completed_ok = True
                 if history is not None:
@@ -673,23 +1318,72 @@ async def run_reports_then_analysis_then_campaign(
                     elif hasattr(history, "final_result"):
                         val = history.final_result
                         completed_ok = bool(val() if callable(val) else val) if val is not None else False
-                if completed_ok:
+
+                # Check for duplicate campaign
+                final_text = ""
+                if history is not None and hasattr(history, "final_result"):
+                    val = history.final_result
+                    final_text = str(val() if callable(val) else val) if val is not None else ""
+                duplicate_phrases = [
+                    "same as one of your live campaigns",
+                    "duplicate",
+                    "already exists",
+                    "campaign are the same",
+                ]
+                is_duplicate = any(p in final_text.lower() for p in duplicate_phrases)
+
+                if is_duplicate:
+                    status = "Skipped (duplicate)"
+                    stats["skipped"] += 1
+                elif completed_ok:
                     status = "Successful"
-                    push_to_slack(f"{campaign_name} — done")
+                    stats["successful"] += 1
                 else:
                     status = "Failed"
-                    push_to_slack(f"{campaign_name} — failed (agent stopped without completing)")
-                    logger.warning("Campaign %s: agent stopped without completing", campaign_name)
+                    stats["failed"] += 1
             except asyncio.TimeoutError:
                 status = "Failed"
-                logger.warning("Campaign %s timed out after %ss", campaign_name, AGENT_CAMPAIGN_TIMEOUT)
-                push_to_slack(f"{campaign_name} — timed out")
+                stats["timed_out"] += 1
+                stats["failed"] += 1
             except Exception as e:
                 status = "Failed"
-                logger.warning("Campaign %s failed: %s", campaign_name, e)
-                push_to_slack(f"{campaign_name} — failed: {e}")
+                stats["failed"] += 1
+                logger.warning("[%d/%d] %s error: %s", i, total, campaign_name, e)
 
-            # Write status live to Campaign Mappings sheet so reruns can skip Successful ones
+            # --- Timing ---
+            campaign_elapsed = time.time() - campaign_start
+            campaign_times.append(campaign_elapsed)
+
+            # --- Terminal log with result ---
+            status_icon = {"Successful": "OK", "Skipped (duplicate)": "SKIP", "Failed": "FAIL"}.get(status, "FAIL")
+            logger.info(
+                "[%d/%d] %s %s (%.0fs) | Running: %d ok, %d fail, %d skip, %d timeout",
+                i, total, status_icon, campaign_name, campaign_elapsed,
+                stats["successful"], stats["failed"], stats["skipped"], stats["timed_out"],
+            )
+
+            # --- Slack: per-campaign status + periodic progress ---
+            if status == "Successful":
+                push_to_slack(f"[{i}/{total}] {campaign_name} — done ({campaign_elapsed:.0f}s)")
+            elif status == "Skipped (duplicate)":
+                push_to_slack(f"[{i}/{total}] {campaign_name} — skipped (duplicate already live)")
+            elif "timed_out" in str(stats.get("_last_reason", "")) or campaign_elapsed >= AGENT_CAMPAIGN_TIMEOUT - 5:
+                push_to_slack(f"[{i}/{total}] {campaign_name} — timed out ({AGENT_CAMPAIGN_TIMEOUT}s limit)")
+            else:
+                push_to_slack(f"[{i}/{total}] {campaign_name} — failed ({campaign_elapsed:.0f}s)")
+
+            # Slack progress summary every 10 campaigns
+            if i % 10 == 0 or i == total:
+                elapsed_total = time.time() - phase2_start
+                remaining = total - i
+                eta_total = (elapsed_total / i) * remaining if i > 0 else 0
+                push_to_slack(
+                    f"*Progress: {i}/{total} ({pct:.0f}%)*\n"
+                    f"Results: {stats['successful']} ok | {stats['failed']} failed | {stats['skipped']} skipped | {stats['timed_out']} timed out\n"
+                    f"Avg: {sum(campaign_times)/len(campaign_times):.0f}s/campaign | Elapsed: {elapsed_total/60:.0f}m | ETA: {eta_total/60:.0f}m remaining"
+                )
+
+            # --- Write status to tracking ---
             if combined_path and Path(combined_path).is_file():
                 update_campaign_mapping_status(Path(combined_path), campaign_name, status)
 
@@ -703,9 +1397,30 @@ async def run_reports_then_analysis_then_campaign(
                     max_discount="Always lowest",
                     status=status,
                 )
-            logger.info("DoorDash (browser-use): Campaign %s/%s done: %s [%s]", i, len(combos), campaign_name, status)
-            # Brief yield to let the event loop breathe; not a hard wait
+
             await asyncio.sleep(1)
+
+        # --- Final summary ---
+        total_elapsed = time.time() - phase2_start
+        success_rate = (stats["successful"] / total * 100) if total > 0 else 0
+        avg_campaign = sum(campaign_times) / len(campaign_times) if campaign_times else 0
+
+        logger.info("=" * 70)
+        logger.info("PHASE 2 COMPLETE")
+        logger.info("  Total:      %d campaigns in %.0f min (%.1f hrs)", total, total_elapsed / 60, total_elapsed / 3600)
+        logger.info("  Successful: %d (%.0f%%)", stats["successful"], success_rate)
+        logger.info("  Failed:     %d (timed out: %d)", stats["failed"], stats["timed_out"])
+        logger.info("  Skipped:    %d (duplicate)", stats["skipped"])
+        logger.info("  Avg time:   %.0fs per campaign", avg_campaign)
+        logger.info("  Est. cost:  $%.2f (@ $0.002/step)", total * avg_campaign / 6.8 * 0.002)  # rough estimate
+        logger.info("=" * 70)
+
+        push_to_slack(
+            f"*Phase 2 complete*\n"
+            f"Campaigns: {total} total | {stats['successful']} ok | {stats['failed']} failed | {stats['skipped']} skipped\n"
+            f"Success rate: {success_rate:.0f}% | Timeouts: {stats['timed_out']}\n"
+            f"Time: {total_elapsed/60:.0f} min ({total_elapsed/3600:.1f} hrs) | Avg: {avg_campaign:.0f}s/campaign"
+        )
 
     else:
         logger.warning(

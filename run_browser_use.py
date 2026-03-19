@@ -61,18 +61,30 @@ def _get_llm():
 
 
 def _get_browser():
-    """Browser with optional persistent profile and download path set to project downloads/."""
+    """
+    Browser with download path set to project downloads/.
+    Supports remote CDP (GCP headless Chrome), Multilogin, or local Chrome.
+    """
     from browser_use import Browser
 
+    downloads_path = str(DOWNLOAD_DIR.resolve())
+
+    # Remote CDP (GCP headless Chrome, Browserless, etc.)
+    cdp_url = os.environ.get("LOCAL_BROWSER_CDP_URL", "").strip()
+    if cdp_url:
+        return Browser(
+            cdp_url=cdp_url,
+            downloads_path=downloads_path,
+            enable_default_extensions=False,
+        )
+
+    # Local Chrome with persistent profile (laptop fallback)
     raw_dir = os.environ.get("CHROME_USER_DATA_DIR", "").strip()
     if raw_dir:
         user_data_dir = str(Path(raw_dir).expanduser().resolve())
     else:
         user_data_dir = str(Path(__file__).resolve().parent / ".cursor" / "chrome-debug-profile")
 
-    # So the judge sees files in the requested folder (docs: downloads_path)
-    downloads_path = str(DOWNLOAD_DIR.resolve())
-    # Skip default extensions to avoid SSL cert errors when downloading uBlock etc. on macOS
     common = dict(
         user_data_dir=user_data_dir,
         downloads_path=downloads_path,

@@ -226,6 +226,43 @@ async def _analysis_phase(
     return combined_path
 
 
+def _sanitize_email(email: str) -> str:
+    """Sanitize email for use in folder names."""
+    safe = (email or "run").strip()
+    for c in ("@", ".", " ", "/", "\\"):
+        safe = safe.replace(c, "_")
+    return safe[:50] if len(safe) > 50 else safe
+
+
+def _find_latest_run_with_pending_campaigns(email: str) -> tuple[Path | None, Path | None]:
+    """
+    Find the latest existing run folder for this email that has a combined_analysis
+    with Campaign Mappings containing non-Successful campaigns.
+    Returns (run_dir, combined_path) or (None, None) if not found.
+    """
+    import re
+    from agents.combined_report_agent import read_campaign_combos_from_mappings
+
+    safe = _sanitize_email(email)
+
+    for folder in sorted(DOWNLOADS_ROOT.glob(f"{safe}-*"), reverse=True):
+        if not folder.is_dir():
+            continue
+        if not re.match(rf"^{re.escape(safe)}-\d{{8}}_\d{{6}}$", folder.name):
+            continue
+        combined_files = sorted(folder.glob("combined_analysis_*.xlsx"), reverse=True)
+        if not combined_files:
+            continue
+        combined_path = combined_files[0]
+        combos = read_campaign_combos_from_mappings(combined_path)
+        if not combos:
+            continue
+        pending = [c for c in combos if c.get("status") != "Successful"]
+        if pending:
+            return folder, combined_path
+    return None, None
+
+
 async def run_workflow() -> None:
     """Single browser session: login → reports → download → (browser stays open) → analysis → campaign (no second login) → close."""
     logger = logging.getLogger("main")
@@ -234,12 +271,40 @@ async def run_workflow() -> None:
     doordash_password = get_required_env("DOORDASH_PASSWORD")
     get_required_env("BROWSER_USE_API_KEY")
 
-    run_dir = _run_dir_for_email(doordash_email)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("Run directory: %s", run_dir)
-
     report_start_date, report_end_date = get_last_three_months_date_range()
     logger.info("Report date range (last 3 months): %s to %s", report_start_date, report_end_date)
+
+    # --- Auto-detect campaigns-only mode ---
+    # If an existing run folder has pending (non-Successful) campaigns,
+    # reuse that folder and skip report download + analysis.
+    # Set FORCE_FULL_RUN=true to override and always run the full pipeline.
+    force_full = os.getenv("FORCE_FULL_RUN", "").strip().lower() in ("1", "true", "yes")
+    campaigns_only_combined_path: Path | None = None
+    run_dir: Path | None = None
+
+    if not force_full:
+        existing_dir, existing_combined = _find_latest_run_with_pending_campaigns(doordash_email)
+        if existing_dir and existing_combined:
+            from agents.combined_report_agent import read_campaign_combos_from_mappings
+            all_combos = read_campaign_combos_from_mappings(existing_combined)
+            total = len(all_combos)
+            successful = sum(1 for c in all_combos if c.get("status") == "Successful")
+            pending = total - successful
+            run_dir = existing_dir
+            campaigns_only_combined_path = existing_combined
+            logger.info(
+                "AUTO-RESUME: Found existing run with %d/%d campaigns pending in %s",
+                pending, total, existing_dir.name,
+            )
+            logger.info("AUTO-RESUME: Using combined analysis %s", campaigns_only_combined_path)
+            logger.info("AUTO-RESUME: Skipping report download + analysis, going straight to campaigns")
+            logger.info("AUTO-RESUME: Set FORCE_FULL_RUN=true to override and run full pipeline")
+
+    if run_dir is None:
+        run_dir = _run_dir_for_email(doordash_email)
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Run directory: %s", run_dir)
 
     last_error: Exception | None = None
 
@@ -257,6 +322,7 @@ async def run_workflow() -> None:
                 start_date=report_start_date,
                 end_date=report_end_date,
                 analysis_callback=analysis_callback,
+                campaigns_only_combined_path=campaigns_only_combined_path,
             )
             logger.info("Campaign creation completed.")
             return

@@ -2,11 +2,9 @@
 MarketingAgent: runs after browser downloads the marketing report. Extracts the download
 (ZIP or folder), runs marketing analysis (create_corporate_vs_todc_table and related
 tables), and writes the final marketing analysis Excel to the downloads folder.
-Requires marketing_analysis module on PYTHONPATH or installed.
 """
 
 import logging
-import sys
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -18,41 +16,6 @@ try:
     import pandas as pd
 except ImportError:
     pd = None
-
-
-def _mock_streamlit() -> None:
-    """
-    Install a catch-all streamlit mock so marketing_analysis can be imported without Streamlit.
-    Any attribute access returns a no-op callable/context manager so future streamlit API
-    additions don't break the mock.
-    """
-    import types
-
-    def _noop(*args, **kwargs):
-        return None
-
-    class _NoopCtx:
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            return False
-
-    def _noop_ctx(*args, **kwargs):
-        return _NoopCtx()
-
-    class _MockStreamlit(types.ModuleType):
-        """Module subclass — __getattr__ absorbs any unknown streamlit attribute."""
-        session_state: dict = {}
-        cache_data = staticmethod(lambda f: f)  # decorator — returns the function unchanged
-
-        def __getattr__(self, name: str):
-            # Return context manager for known context-manager patterns, else plain no-op
-            if name in ("spinner", "expander", "container", "sidebar", "form", "empty"):
-                return _noop_ctx
-            return _noop
-
-    mock = _MockStreamlit("streamlit")
-    sys.modules["streamlit"] = mock
 
 
 def _is_zip(path: Path) -> bool:
@@ -228,33 +191,9 @@ def run(
         logger.warning("MarketingAgent: No marketing folder to process")
         return None
 
-    _mock_streamlit()
-    try:
-        from marketing_analysis import (
-            create_corporate_vs_todc_table,
-            get_promotion_by_campaign_table,
-            get_promotion_by_store_table,
-            get_sponsored_by_campaign_table,
-            get_sponsored_by_store_table,
-            get_marketing_by_store_combined,
-        )
-    except ImportError as e:
-        logger.warning(
-            "MarketingAgent: marketing_analysis module not available (add to PYTHONPATH or install): %s",
-            e,
-        )
-        return None
-    except Exception as e:
-        logger.warning("MarketingAgent: Failed to import marketing_analysis: %s", e)
-        return None
+    from agents.marketing_data import create_corporate_vs_todc_table
 
     excluded_dates = excluded_dates or []
-    kwargs = dict(
-        excluded_dates=excluded_dates,
-        post_start_date=post_start_date,
-        post_end_date=post_end_date,
-        marketing_folder_path=marketing_folder,
-    )
     try:
         promotion_table, sponsored_table, combined_table = create_corporate_vs_todc_table(
             excluded_dates=excluded_dates,
@@ -268,15 +207,8 @@ def run(
         logger.warning("MarketingAgent: create_corporate_vs_todc_table failed: %s", e)
         return None
 
+    # By-campaign / by-store breakdowns not yet implemented
     promotion_by_campaign = promotion_by_store = sponsored_by_campaign = sponsored_by_store = store_wise_marketing = None
-    try:
-        promotion_by_campaign = get_promotion_by_campaign_table(**kwargs)
-        promotion_by_store = get_promotion_by_store_table(**kwargs)
-        sponsored_by_campaign = get_sponsored_by_campaign_table(**kwargs)
-        sponsored_by_store = get_sponsored_by_store_table(**kwargs)
-        store_wise_marketing = get_marketing_by_store_combined(**kwargs)
-    except Exception as e:
-        logger.debug("MarketingAgent: By-campaign/by-store tables failed (non-fatal): %s", e)
 
     sheets_list: List[Tuple[str, object]] = []
     if combined_table is not None and not (getattr(combined_table, "empty", True)):
