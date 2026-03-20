@@ -53,3 +53,5 @@ logs/
 playwright-report/
 test-results/
 .playwright/
+
+run_*.log
