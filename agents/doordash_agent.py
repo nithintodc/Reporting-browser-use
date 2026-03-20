@@ -220,6 +220,9 @@ def _build_campaign_tools():
             break;
         }
     }
+    // Record initial Weekdays button y so we can measure banner-shift later
+    var wRect = weekdaysBtn.getBoundingClientRect();
+    result.weekdaysY = Math.round(wRect.top + wRect.height / 2);
     return JSON.stringify(result);
 })()
 """
@@ -243,6 +246,7 @@ def _build_campaign_tools():
 
             cells = grid_info["cells"]  # list of {tag, x, y, checked}
             save_btn = grid_info.get("saveBtn")
+            initial_weekdays_y: int = grid_info.get("weekdaysY", 0)  # for banner-shift measurement
 
             if len(cells) != 42:
                 return ActionResult(error=f"Expected 42 cells, found {len(cells)}")
@@ -285,101 +289,190 @@ def _build_campaign_tools():
                 )
                 await asyncio.sleep(0.05)  # tiny delay for React to process
 
-            # Click all cells that need toggling using coordinates from the initial scan.
-            # We process row-by-row and scroll each row into view first, but we use
-            # a scroll approach that does NOT rely on re-detecting grid rows (which
-            # breaks after toggling cells since unchecked cells lose their SVG checkmarks).
+            # ── CLICK STRATEGY ────────────────────────────────────────────────────────
+            # Rule: if len(wanted) ≤ 21 → CLEAR-AND-SELECT
+            #         Click Weekdays + Weekends to empty the grid, then CHECK each
+            #         wanted cell.  Only 2 + len(wanted) clicks.
+            #       if len(wanted) > 21 → UNCHECK-UNWANTED
+            #         Directly UNCHECK each cell not in wanted.
+            #
+            # COORDINATE APPROACH — banner-shift adjustment:
+            #   The initial scan captures CORRECT coordinates (all cells have SVGs,
+            #   grid is stable, no banner).  After we start toggling cells, DoorDash
+            #   inserts a "Run all day" recommendation banner that pushes the grid
+            #   DOWN by its height (typically 50-120 px).
+            #
+            #   Rather than re-querying the DOM for each cell (which can find the
+            #   wrong row due to ambiguous 7-child sibling matching), we:
+            #     1. Record the Weekdays button y at initial scan time (no banner).
+            #     2. Before each cell click, re-read the Weekdays button y.
+            #     3. shift = current_weekdays_y - initial_weekdays_y
+            #     4. Adjusted click = (initial_x, initial_y + shift)
+            #   Since the banner pushes BOTH the Weekdays button AND grid cells down
+            #   by the same amount, this single measurement corrects all coordinates.
+            # ──────────────────────────────────────────────────────────────────────────
+
             clicked = 0
-            cell_lookup = {c["tag"]: c for c in cells}
+            cell_coords = {c["tag"]: (c["x"], c["y"]) for c in cells}
 
-            for row_idx in range(6):
-                row_tags = {row_idx * 7 + col + 1 for col in range(7)}
-                row_needs_click = row_tags & to_click
-                if not row_needs_click:
-                    continue
+            # JS that returns the current Weekdays button y (to measure banner shift)
+            _JS_WEEKDAYS_Y = (
+                "(function(){"
+                "var bs=document.querySelectorAll('button');"
+                "for(var i=0;i<bs.length;i++){"
+                "if(bs[i].textContent.trim()==='Weekdays'){"
+                "var r=bs[i].getBoundingClientRect();"
+                "return JSON.stringify({y:Math.round(r.top+r.height/2)});}}"
+                "return '{}';  })()"
+            )
 
-                # Scroll the first cell of this row into view using its initial coordinates.
-                # We use window.scrollTo or elementFromPoint to ensure visibility.
-                first_tag = min(row_needs_click)
-                first_cell = cell_lookup[first_tag]
-                js_scroll_to_y = f"""
-(function() {{
-    // Scroll the grid modal so that y={first_cell['y']} is visible
-    var el = document.elementFromPoint({first_cell['x']}, {first_cell['y']});
-    if (el) {{
-        el.scrollIntoView({{behavior: 'instant', block: 'center'}});
-        return JSON.stringify({{ok: true}});
-    }}
-    // Fallback: try scrolling the modal container
-    var weekdaysBtn = null;
-    var allBtns = document.querySelectorAll('button');
-    for (var i = 0; i < allBtns.length; i++) {{
-        if (allBtns[i].textContent.trim() === 'Weekdays') {{ weekdaysBtn = allBtns[i]; break; }}
-    }}
-    if (weekdaysBtn) {{
-        var container = weekdaysBtn;
-        for (var up = 0; up < 12; up++) {{ container = container.parentElement; if (!container) break; }}
-        if (container && container.scrollTo) {{
-            container.scrollTo(0, {max(0, first_cell['y'] - 300)});
-        }}
-    }}
-    return JSON.stringify({{ok: true}});
-}})()
-"""
+            # JS that returns the current coords of a named button within the modal
+            _JS_BTN_COORD = (
+                "(function(t){"
+                "var w=null,bs=document.querySelectorAll('button');"
+                "for(var i=0;i<bs.length;i++){if(bs[i].textContent.trim()==='Weekdays'){w=bs[i];break;}}"
+                "if(!w)return'{}';"
+                "var c=w;for(var u=0;u<12;u++){c=c.parentElement;if(!c)break;}"
+                "if(!c)return'{}';"
+                "var tgt=null,ab=c.querySelectorAll('button');"
+                "for(var i=0;i<ab.length;i++){if(ab[i].textContent.trim()===t){tgt=ab[i];break;}}"
+                "if(!tgt)return'{}';"
+                "var r=tgt.getBoundingClientRect();"
+                "return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)});"
+                "})"
+            )
+
+            async def _get_banner_shift() -> int:
+                """Measure how far the banner pushed the grid down since initial scan."""
+                if not initial_weekdays_y:
+                    return 0
                 try:
-                    await cdp_client.send.Runtime.evaluate(
-                        params={"expression": js_scroll_to_y, "returnByValue": True, "awaitPromise": True},
+                    res = await cdp_client.send.Runtime.evaluate(
+                        params={"expression": _JS_WEEKDAYS_Y, "returnByValue": True, "awaitPromise": True},
                         session_id=session_id,
                     )
+                    val = res.get("result", {}).get("value", "{}")
+                    curr_y = (json.loads(val) if isinstance(val, str) else val).get("y", 0)
+                    if curr_y:
+                        return curr_y - initial_weekdays_y
+                except Exception:
+                    pass
+                return 0
+
+            async def _click_cell(tag: int, action: str) -> bool:
+                """Click a grid cell using initial-scan coordinates adjusted for banner shift."""
+                x, y = cell_coords.get(tag, (0, 0))
+                if not (x and y):
+                    logger.warning("set_schedule_grid: no initial coord for tag %d", tag)
+                    return False
+                shift = await _get_banner_shift()
+                adj_y = y + shift
+                row_label = _GRID_ROW_NAMES[(tag - 1) // 7]
+                col_name  = _GRID_COL_NAMES[(tag - 1) % 7]
+                if shift:
+                    logger.info("set_schedule_grid: %s tag %d (%s/%s) at (%d,%d) [banner shift=%+d]",
+                                action, tag, row_label, col_name, x, adj_y, shift)
+                else:
+                    logger.info("set_schedule_grid: %s tag %d (%s/%s) at (%d,%d)",
+                                action, tag, row_label, col_name, x, adj_y)
+                await cdp_click(x, adj_y)
+                return True
+
+            async def _click_modal_btn(btn_text: str) -> bool:
+                """Click a button inside the schedule modal by its text label (live coords)."""
+                js = _JS_BTN_COORD + "(" + json.dumps(btn_text) + ")"
+                try:
+                    res = await cdp_client.send.Runtime.evaluate(
+                        params={"expression": js, "returnByValue": True, "awaitPromise": True},
+                        session_id=session_id,
+                    )
+                    val = res.get("result", {}).get("value", "{}")
+                    coord = json.loads(val) if isinstance(val, str) else val
+                    x, y = coord.get("x", 0), coord.get("y", 0)
+                    if x and y:
+                        await cdp_click(x, y)
+                        logger.info("set_schedule_grid: clicked '%s' button at (%d,%d)", btn_text, x, y)
+                        return True
+                except Exception as e:
+                    logger.debug("set_schedule_grid: btn '%s' failed: %s", btn_text, e)
+                logger.warning("set_schedule_grid: could not find/click '%s' button", btn_text)
+                return False
+
+            async def _settle_and_scroll_bottom() -> None:
+                """Wait for the banner to fully appear, then scroll the modal to the bottom.
+
+                After clicking Weekdays/Weekends (or the first cell toggle), DoorDash
+                inserts a 'Run all day' recommendation banner that:
+                  • shifts the grid downward (handled by _click_cell's shift measurement)
+                  • may cause the bottom rows to overflow the modal's visible area
+
+                Scrolling to the bottom ensures Dinner/Late night rows are fully on-screen
+                before we start clicking cells.  The Weekdays-button shift reference remains
+                valid because both the button and the grid cells share the same scroll container
+                and move by the same offset.
+                """
+                await asyncio.sleep(2.0)   # let the banner render and the layout settle
+
+                # Scroll the modal's inner scroll container all the way to the bottom
+                js_scroll_bottom = (
+                    "(function(){"
+                    "var w=null,bs=document.querySelectorAll('button');"
+                    "for(var i=0;i<bs.length;i++){if(bs[i].textContent.trim()==='Weekdays'){w=bs[i];break;}}"
+                    "if(!w)return '0';"
+                    "var c=w;"
+                    "for(var u=0;u<12;u++){c=c.parentElement;if(!c)break;}"
+                    "if(c&&c.scrollHeight>c.clientHeight){c.scrollTop=c.scrollHeight;return String(c.scrollTop);}"
+                    "return '0';})()"
+                )
+                try:
+                    res = await cdp_client.send.Runtime.evaluate(
+                        params={"expression": js_scroll_bottom, "returnByValue": True, "awaitPromise": True},
+                        session_id=session_id,
+                    )
+                    scrolled = res.get("result", {}).get("value", "0")
+                    logger.info("set_schedule_grid: scrolled modal to bottom (scrollTop=%s)", scrolled)
                 except Exception as scroll_err:
-                    logger.debug("set_schedule_grid: scroll hint for row %d: %s", row_idx, scroll_err)
+                    logger.debug("set_schedule_grid: scroll-to-bottom failed: %s", scroll_err)
 
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(0.5)   # let scroll settle before measuring shift + clicking
 
-                # Re-read coordinates for THIS row's cells after scrolling
-                # Use a simple JS that finds elements at the original x,y or nearby
-                js_refresh_row = f"""
-(function() {{
-    var tags = {list(sorted(row_needs_click))};
-    var origCoords = {json.dumps({{t: {{"x": cell_lookup[t]["x"], "y": cell_lookup[t]["y"]}} for t in sorted(row_needs_click)}})};
-    var result = [];
-    for (var i = 0; i < tags.length; i++) {{
-        var tag = tags[i];
-        var ox = origCoords[tag].x;
-        var oy = origCoords[tag].y;
-        var el = document.elementFromPoint(ox, oy);
-        if (el) {{
-            var rect = el.getBoundingClientRect();
-            result.push({{tag: tag, x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2)}});
-        }} else {{
-            result.push({{tag: tag, x: ox, y: oy}});
-        }}
-    }}
-    return JSON.stringify(result);
-}})()
-"""
-                try:
-                    refresh_result = await cdp_client.send.Runtime.evaluate(
-                        params={"expression": js_refresh_row, "returnByValue": True, "awaitPromise": True},
-                        session_id=session_id,
-                    )
-                    refresh_raw = refresh_result.get("result", {}).get("value", "[]")
-                    refreshed = json.loads(refresh_raw) if isinstance(refresh_raw, str) else refresh_raw
-                    # Update cell_lookup with fresh coords
-                    for rc in refreshed:
-                        if rc["tag"] in cell_lookup:
-                            cell_lookup[rc["tag"]]["x"] = rc["x"]
-                            cell_lookup[rc["tag"]]["y"] = rc["y"]
-                except Exception as refresh_err:
-                    logger.debug("set_schedule_grid: coord refresh for row %d: %s (using original)", row_idx, refresh_err)
+            if len(wanted) <= 21:
+                # ── CLEAR-AND-SELECT ─────────────────────────────────────────────────
+                # Click Weekdays → banner appears (screenshot 2 state).
+                # Click Weekends → grid is now empty (screenshot 1 / "no selections" warning
+                # would appear if Save were clicked here).
+                # Wait + scroll so the banner is stable and all rows are visible before
+                # we start checking individual cells.
+                logger.info("set_schedule_grid: STRATEGY=clear-and-select "
+                            "(%d wanted ≤ 21 → click Weekdays+Weekends, then CHECK %d cells)",
+                            len(wanted), len(wanted))
+                await _click_modal_btn("Weekdays")
+                await asyncio.sleep(2.0)   # wait for banner to appear after 1st toggle
+                await _click_modal_btn("Weekends")
+                await _settle_and_scroll_bottom()  # wait 2s + scroll to bottom
+                cells_to_click   = sorted(wanted)
+                click_action     = "CHECK"
+                expected_toggles = len(wanted)
+            else:
+                # ── UNCHECK-UNWANTED ─────────────────────────────────────────────────
+                # Banner appears after the first cell is unchecked (screenshot 3 state
+                # shows the grid partially filled — same banner appears for any partial
+                # schedule).  Click one cell, wait + scroll, then continue.
+                logger.info("set_schedule_grid: STRATEGY=uncheck-unwanted "
+                            "(%d wanted > 21 → UNCHECK %d cells)",
+                            len(wanted), len(to_click))
+                cells_to_click   = sorted(to_click)
+                click_action     = "UNCHECK"
+                expected_toggles = len(to_click)
+                # First click triggers the banner
+                if cells_to_click:
+                    if await _click_cell(cells_to_click[0], click_action):
+                        clicked += 1
+                    await _settle_and_scroll_bottom()  # wait 2s + scroll to bottom
+                    cells_to_click = cells_to_click[1:]  # remaining cells
 
-                # Click each cell that needs toggling in this row
-                for tag in sorted(row_needs_click):
-                    c = cell_lookup[tag]
-                    action_type = "UNCHECK" if tag in need_uncheck else "CHECK"
-                    logger.info("set_schedule_grid: %s tag %d (%s) at (%d, %d)",
-                                action_type, tag, _tag_label(tag), c["x"], c["y"])
-                    await cdp_click(c["x"], c["y"])
+            for tag in cells_to_click:
+                if await _click_cell(tag, click_action):
                     clicked += 1
 
             # Verify: scroll Save into view, re-read full grid state
@@ -501,11 +594,11 @@ def _build_campaign_tools():
                     if corrections and len(corrections) <= 15:
                         logger.info("set_schedule_grid: CORRECTING %d cells...", len(corrections))
                         for corr_tag in sorted(corrections):
-                            if corr_tag in cell_lookup:
-                                cc = cell_lookup[corr_tag]
+                            if corr_tag in cell_coords:
+                                cx, cy = cell_coords[corr_tag]
                                 logger.info("set_schedule_grid: CORRECT tag %d (%s) at (%d, %d)",
-                                            corr_tag, _tag_label(corr_tag), cc["x"], cc["y"])
-                                await cdp_click(cc["x"], cc["y"])
+                                            corr_tag, _tag_label(corr_tag), cx, cy)
+                                await cdp_click(cx, cy)
                                 clicked += 1
                         await asyncio.sleep(0.2)
 
@@ -522,14 +615,15 @@ def _build_campaign_tools():
                 clicked += 1
 
             actual_toggled = clicked - (1 if save_clicked else 0)  # exclude Save click
-            expected_toggles = len(to_click)
+            # expected_toggles is set by the strategy block above (len(wanted) or len(to_click))
             if save_clicked and actual_toggled >= expected_toggles:
                 status_word = "SUCCESS"
             elif save_clicked and actual_toggled > 0:
                 status_word = "PARTIAL"
             else:
                 status_word = "ERROR"
-            msg = f"{status_word}: {actual_toggled}/{expected_toggles} cells toggled ({len(need_uncheck)} to uncheck, {len(need_check)} to check), {clicked} CDP clicks"
+            strategy = "clear-and-select" if len(wanted) <= 21 else "uncheck-unwanted"
+            msg = f"{status_word} [{strategy}]: {actual_toggled}/{expected_toggles} cells clicked, {clicked} total CDP clicks"
             if not save_clicked:
                 msg += ". Save button not found — click Save manually."
             if actual_toggled < expected_toggles:
@@ -722,10 +816,11 @@ STEP 4B — Re-confirm Maximum discount amount (MANDATORY after schedule):
 - Click "Save".
 - This step is REQUIRED because DoorDash may change available max discount options after the schedule is modified.
 
-STEP 5 — Set campaign name:
-- Click Edit (pencil) next to "Campaign name".
-- Clear all text, type exactly: {campaign_name}
-- Click "Save".
+STEP 5 — Set campaign name (MUST complete fully before moving to Step 6):
+- Click Edit (pencil) next to "Campaign name". Wait for the name input field to appear.
+- Triple-click the input field to select all existing text, then type exactly: {campaign_name}
+- Click "Save". WAIT until the modal closes and the campaign summary shows "{campaign_name}".
+- CRITICAL: Do NOT click "Create promotion" until this Save is confirmed. If the modal is still open, click Save again.
 
 STEP 6 — Final verify and create (do NOT skip):
 - BEFORE clicking "Create promotion", read the campaign summary panel:
