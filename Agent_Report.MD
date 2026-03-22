@@ -410,6 +410,30 @@ await cdp_click(x, y)
 
 ---
 
+## 9C. Bug F: Late Night Row (Slots 36–42) Missed After Modal Scroll-to-Bottom (tsgmgmtg, Mar 2026)
+
+### 9C.1 Symptom
+
+Campaigns such as `TODC-21463-$25`, `TODC-816-$30`, `TODC-324-$30`, `TODC-5930-$30`, `TODC-26809-$25`, `TODC-22657-$30`, `TODC-1927-$25` reported **success** in logs, but screenshots showed **no selections in the last row (Late night, tags 36–42)** while upper rows matched (or partially matched) the intended pattern.
+
+### 9C.2 Why It Affected These Campaigns (and Not Others)
+
+- All listed campaigns have **`len(wanted) ≤ 21`**, so the agent uses **clear-and-select**: Weekdays → Weekends → `_settle_and_scroll_bottom()` → then CHECK each wanted cell.
+- After the banner appears, `_settle_and_scroll_bottom()` sets the modal inner **`scrollTop` to the bottom** so Dinner/Late night stay visible.
+- **Cell coordinates were captured once** at the start, when `scrollTop ≈ 0`.
+- Clicks use `adjusted_y = initial_y + (current_weekdays_y - initial_weekdays_y)` (banner-shift correction). That assumes **Weekdays and every grid cell move by the same viewport delta** when the scroll container scrolls.
+- In DoorDash’s layout, **Weekdays/Weekends often sit in a sticky header or a different subtree** than the pane whose `scrollTop` we change. Then:
+  - `shift` only reflects the banner (~tens of px), **not** the large scroll offset.
+  - True Late night cells move **up** in the viewport; we still click at **pre-scroll Y + small shift** → click lands **too low** (below the last row or on chrome below the grid).
+- Campaigns with **>21** wanted slots use **uncheck-unwanted** and the same scroll-after-first-toggle path — same failure mode possible for bottom-row toggles.
+
+### 9C.3 Fix Applied
+
+1. **After `_settle_and_scroll_bottom()`**, re-run the grid discovery JS and **replace `cell_coords` and `initial_weekdays_y`** with fresh `getBoundingClientRect()` values at the **current** scroll position.
+2. **Correction pass** (when verify detects mismatch): apply **`_get_banner_shift()`** to correction clicks (previously used raw coords).
+
+---
+
 ## 10. Summary
 
 The agent system is **production-capable** with robust auto-resume, status tracking, and observability. The `set_schedule_grid` CDP tool went through three iterations of bugs and fixes — the current version (using plain string concatenation and initial-scan coordinates) is verified correct. The main remaining risk is **mid-campaign CDP connection drops** and **campaigns created with wrong settings that must be manually cleaned up**. Implementing the CDP health ping (6.3) and mid-campaign recovery (6.1) would significantly reduce the need for manual intervention.
@@ -420,7 +444,7 @@ The agent system is **production-capable** with robust auto-resume, status track
 | Analysis Pipeline | Solid (parallel execution, Google Sheets push) |
 | Campaign Creation | Good (87% success, 100% duplicate detection) |
 | Auto-Resume | Excellent (seamless cross-run state preservation) |
-| Schedule Grid | Fixed and verified (3 bug iterations, current code correct) |
+| Schedule Grid | Fixed; Bug F (post-scroll stale coords for Late night) addressed via coord refresh |
 | Browser Stability | Adequate (periodic restarts work, but mid-session crashes unhandled) |
 | Observability | Excellent (Slack, CSV, structured logs, progress ETAs) |
 | Manual Cleanup Needed | TODC-12583-$20 and TODC-12583-$25 on DoorDash portal have wrong slots |

@@ -436,6 +436,49 @@ def _build_campaign_tools():
 
                 await asyncio.sleep(0.5)   # let scroll settle before measuring shift + clicking
 
+            async def _refresh_grid_coords_from_dom() -> bool:
+                """Re-capture cell (x,y) and weekdaysY after scroll/layout.
+
+                _settle_and_scroll_bottom() changes the modal's scrollTop. Cached
+                coordinates from the *initial* scan were taken at scrollTop≈0.
+                The Weekdays-button banner-shift trick only works if Weekdays and
+                every grid cell move identically in viewport space. DoorDash often
+                puts Weekdays/Weekends in a sticky header or a different subtree than
+                the scrolled pane — then shift under-corrects and clicks land too low,
+                missing the bottom (Late night) row entirely while upper rows work.
+
+                Refreshing coords after scroll fixes slots 36–42 without relying on
+                that assumption.
+                """
+                nonlocal cell_coords, initial_weekdays_y
+                try:
+                    res = await cdp_client.send.Runtime.evaluate(
+                        params={"expression": js_find_grid, "returnByValue": True, "awaitPromise": True},
+                        session_id=session_id,
+                    )
+                    if res.get("exceptionDetails"):
+                        return False
+                    raw_val = res.get("result", {}).get("value", "{}")
+                    fresh = json.loads(raw_val) if isinstance(raw_val, str) else raw_val
+                    if "error" in fresh or len(fresh.get("cells", [])) != 42:
+                        logger.warning(
+                            "set_schedule_grid: coord refresh skipped: %s",
+                            fresh.get("error", "not 42 cells"),
+                        )
+                        return False
+                    cell_coords = {c["tag"]: (c["x"], c["y"]) for c in fresh["cells"]}
+                    initial_weekdays_y = int(fresh.get("weekdaysY") or 0)
+                    logger.info(
+                        "set_schedule_grid: refreshed coordinates after scroll/layout "
+                        "(weekdays_y=%s, sample tag42=%s)",
+                        initial_weekdays_y,
+                        cell_coords.get(42),
+                    )
+                    return True
+                except Exception as ex:
+                    logger.warning("set_schedule_grid: coord refresh failed: %s", ex)
+                    return False
+
             if len(wanted) <= 21:
                 # ── CLEAR-AND-SELECT ─────────────────────────────────────────────────
                 # Click Weekdays → banner appears (screenshot 2 state).
@@ -450,6 +493,7 @@ def _build_campaign_tools():
                 await asyncio.sleep(2.0)   # wait for banner to appear after 1st toggle
                 await _click_modal_btn("Weekends")
                 await _settle_and_scroll_bottom()  # wait 2s + scroll to bottom
+                await _refresh_grid_coords_from_dom()
                 cells_to_click   = sorted(wanted)
                 click_action     = "CHECK"
                 expected_toggles = len(wanted)
@@ -469,6 +513,7 @@ def _build_campaign_tools():
                     if await _click_cell(cells_to_click[0], click_action):
                         clicked += 1
                     await _settle_and_scroll_bottom()  # wait 2s + scroll to bottom
+                    await _refresh_grid_coords_from_dom()
                     cells_to_click = cells_to_click[1:]  # remaining cells
 
             for tag in cells_to_click:
@@ -593,12 +638,20 @@ def _build_campaign_tools():
                     corrections = missing | extra
                     if corrections and len(corrections) <= 15:
                         logger.info("set_schedule_grid: CORRECTING %d cells...", len(corrections))
+                        corr_shift = await _get_banner_shift()
                         for corr_tag in sorted(corrections):
                             if corr_tag in cell_coords:
                                 cx, cy = cell_coords[corr_tag]
-                                logger.info("set_schedule_grid: CORRECT tag %d (%s) at (%d, %d)",
-                                            corr_tag, _tag_label(corr_tag), cx, cy)
-                                await cdp_click(cx, cy)
+                                adj_cy = cy + corr_shift
+                                logger.info(
+                                    "set_schedule_grid: CORRECT tag %d (%s) at (%d, %d) shift=%+d",
+                                    corr_tag,
+                                    _tag_label(corr_tag),
+                                    cx,
+                                    adj_cy,
+                                    corr_shift,
+                                )
+                                await cdp_click(cx, adj_cy)
                                 clicked += 1
                         await asyncio.sleep(0.2)
 
