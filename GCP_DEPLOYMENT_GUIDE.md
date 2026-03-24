@@ -294,6 +294,8 @@ sudo journalctl -u xvfb -n 20
 
 ## Step 3: Deploy the Application
 
+You can either clone on the VM (below) or **sync from your laptop** with `deploy.sh` after one-time VM setup (Chrome, `.env`, service account key). See [Deploy from laptop (rsync)](#deploy-from-laptop-rsync).
+
 ### 3.1 Clone the repository
 
 ```bash
@@ -652,6 +654,73 @@ sudo shutdown -h now
 | `deploy/02-vm-setup.sh` | **New** — automated VM setup (run on VM via SSH) |
 | `deploy/03-schedule.sh` | **New** — configure cron or auto start/stop |
 | `deploy/04-verify.sh` | **New** — pre-flight check of all components |
+| `deploy.sh` | **New** — rsync project from laptop to GCE VM (`GCP_VM_NAME`, `GCP_ZONE`, optional `--install` / `--verify`) |
+| `git.sh` | **New** — commit and push current (or chosen) branch to `origin` |
+
+---
+
+## Deploy from laptop (rsync)
+
+Use this when you develop locally and want the same tree on the VM **without** logging in to run `git pull`.
+
+### Prerequisites
+
+- Same as [Prerequisites](#prerequisites): `gcloud` installed and authenticated.
+- You can open an SSH session to the instance:  
+  `gcloud compute ssh doordash-bot --zone=us-central1-a`
+- **First time on the VM**: complete Chrome/Xvfb and Python setup (see [Step 2](#step-2-vm-setup-ssh-into-the-vm)) or run `bash deploy/02-vm-setup.sh` so `/opt/doordash-bot` exists and `.venv` + `.env` are configured.  
+  `deploy.sh` creates `/opt/doordash-bot` and fixes ownership if missing, but it does **not** install Chrome or create `.env`.
+
+### `deploy.sh` (code → GCE VM)
+
+From the **project root** on your laptop:
+
+| Command | What it does |
+|--------|----------------|
+| `./deploy.sh` | Rsync repo to the VM (default `doordash-bot` in `us-central1-a` → `/opt/doordash-bot`). Excludes `.git`, `.venv`, `.env`, `downloads/`, `logs/`, and `todc-marketing-*.json`. |
+| `./deploy.sh --install` | After sync, runs `pip install -r requirements.txt` inside `.venv` on the VM (activates `.venv` if present). |
+| `./deploy.sh --verify` | After sync, runs `deploy/04-verify.sh` on the VM. |
+| `./deploy.sh --delete` | Adds `rsync --delete` so extra files under the app dir on the VM are removed. **Use sparingly**; prefer the default incremental sync so ad-hoc files on the server are kept unless you know you want a mirror. |
+
+**Environment overrides** (optional):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `GCP_VM_NAME` | `doordash-bot` | Instance name |
+| `GCP_ZONE` | `us-central1-a` | Zone |
+| `GCP_REMOTE_DIR` | `/opt/doordash-bot` | Remote application path |
+| `GCP_RSYNC_IAP` | unset (`0`) | Set to `1` if you use [IAP tunneling](https://cloud.google.com/iap/docs/using-tcp-forwarding) for SSH |
+
+Example:
+
+```bash
+cd /path/to/Reporting-browser-use-claude-code
+export GCP_VM_NAME=doordash-bot
+export GCP_ZONE=us-central1-a
+./deploy.sh --install
+```
+
+After deploy, run the app on the VM (SSH session):
+
+```bash
+cd /opt/doordash-bot && source .venv/bin/activate && python main.py
+```
+
+### `git.sh` (code → GitHub)
+
+From the **project root**, commit staged changes and push to `origin` (uses your existing `origin` URL — not hard-coded).
+
+| Command | What it does |
+|--------|----------------|
+| `./git.sh` | `git add -A`, prompts for commit message if needed, **push current branch** |
+| `./git.sh "fix: slack notifier"` | Commit with message, push current branch |
+| `./git.sh -b main "chore: release"` | Push branch `main` (ensure you have committed on that branch or are checked out to it) |
+| `./git.sh --dry-run` | Show status/diff only |
+| `GIT_BRANCH=main ./git.sh "msg"` | Default push target `main` via env (ensure that branch has your commits) |
+
+For interactive first-time setup of `origin` and default branch naming, you can still use `./push_to_github.sh`.
+
+**Typical loop**: `./git.sh "describe change"` then `./deploy.sh --install` so GitHub and the VM both match.
 
 ---
 
@@ -679,4 +748,8 @@ curl -s http://localhost:9222/json/version
 
 # Run verification
 bash /opt/doordash-bot/deploy/04-verify.sh
+
+# From laptop (project root): GitHub then GCE
+./git.sh "your commit message"
+./deploy.sh --install
 ```
