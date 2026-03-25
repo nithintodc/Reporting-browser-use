@@ -9,9 +9,10 @@
 #   ./deploy.sh --delete     # rsync --delete (prune extra files on VM; see guide)
 #
 # Configure via environment (optional):
-#   GCP_VM_NAME   default: doordash-bot
-#   GCP_ZONE      default: us-central1-a
+#   GCP_VM_NAME   default: todc-ent-applications
+#   GCP_ZONE      default: us-west2-a
 #   GCP_REMOTE_DIR default: /opt/doordash-bot
+#   GCP_PROJECT_ID optional: pass --project (if not using gcloud default)
 #   GCP_RSYNC_IAP  set to 1 to add --tunnel-through-iap to gcloud ssh/scp
 #
 set -euo pipefail
@@ -19,8 +20,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-GCP_VM_NAME="${GCP_VM_NAME:-doordash-bot}"
-GCP_ZONE="${GCP_ZONE:-us-central1-a}"
+GCP_VM_NAME="${GCP_VM_NAME:-todc-ent-applications}"
+GCP_ZONE="${GCP_ZONE:-us-west2-a}"
 GCP_REMOTE_DIR="${GCP_REMOTE_DIR:-/opt/doordash-bot}"
 
 RUN_INSTALL=0
@@ -43,14 +44,18 @@ if ! command -v gcloud >/dev/null 2>&1; then
   exit 1
 fi
 
-# Single string for rsync -e (must end with -- so gcloud passes flags to ssh correctly)
-GCE_SSH="gcloud compute ssh ${GCP_VM_NAME} --zone=${GCP_ZONE}"
-if [[ "${GCP_RSYNC_IAP:-0}" == "1" ]]; then
-  GCE_SSH+=" --tunnel-through-iap"
+# Rsync runs: deploy/gce-rsync-rsh.sh INSTANCE rsync --server ...
+# Wrapper runs: gcloud compute ssh INSTANCE --zone=... -- rsync ... (required "--").
+RSYNC_RSH="${SCRIPT_DIR}/deploy/gce-rsync-rsh.sh"
+if [[ ! -x "$RSYNC_RSH" ]]; then
+  chmod +x "$RSYNC_RSH"
 fi
-GCE_SSH+=" --"
+export GCP_ZONE GCP_VM_NAME GCP_PROJECT_ID GCP_RSYNC_IAP
 
 SSH_ARR=(gcloud compute ssh "$GCP_VM_NAME" --zone="$GCP_ZONE")
+if [[ -n "${GCP_PROJECT_ID:-}" ]]; then
+  SSH_ARR+=(--project="${GCP_PROJECT_ID}")
+fi
 if [[ "${GCP_RSYNC_IAP:-0}" == "1" ]]; then
   SSH_ARR+=(--tunnel-through-iap)
 fi
@@ -72,7 +77,7 @@ remote() {
 }
 remote "sudo mkdir -p '${GCP_REMOTE_DIR}' && sudo chown -R \"\$(whoami):\" '${GCP_REMOTE_DIR}'"
 
-# rsync uses gcloud as transport; `--` passes remaining args to underlying ssh
+# rsync uses deploy/gce-rsync-rsh.sh as transport
 RSYNC_EXCLUDES=(
   --exclude '.git/'
   --exclude '.venv/'
@@ -97,7 +102,7 @@ echo ""
 echo ">>> Syncing files (rsync)..."
 rsync "${RSYNC_OPTS[@]}" \
   "${RSYNC_EXCLUDES[@]}" \
-  -e "$GCE_SSH" \
+  -e "$RSYNC_RSH" \
   ./ "${GCP_VM_NAME}:${GCP_REMOTE_DIR}/"
 
 if [[ "$RUN_INSTALL" == 1 ]]; then

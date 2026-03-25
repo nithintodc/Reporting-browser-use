@@ -296,6 +296,8 @@ sudo journalctl -u xvfb -n 20
 
 You can either clone on the VM (below) or **sync from your laptop** with `deploy.sh` after one-time VM setup (Chrome, `.env`, service account key). See [Deploy from laptop (rsync)](#deploy-from-laptop-rsync).
 
+If you want the simplest “do everything on the VM” flow (and you hit `browser-use` install issues), follow `deploy/VM_SETUP_MANUAL.md` instead.
+
 ### 3.1 Clone the repository
 
 ```bash
@@ -307,9 +309,9 @@ cd /opt/doordash-bot
 ### 3.2 Set up Python environment
 
 ```bash
-python3 -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
-pip install --upgrade pip
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
@@ -655,6 +657,7 @@ sudo shutdown -h now
 | `deploy/03-schedule.sh` | **New** — configure cron or auto start/stop |
 | `deploy/04-verify.sh` | **New** — pre-flight check of all components |
 | `deploy.sh` | **New** — rsync project from laptop to GCE VM (`GCP_VM_NAME`, `GCP_ZONE`, optional `--install` / `--verify`) |
+| `deploy/gce-rsync-rsh.sh` | **New** — rsync `-e` helper so `gcloud compute ssh` gets `--` before remote `rsync` (fixes “command not found: INSTANCE”) |
 | `git.sh` | **New** — commit and push current (or chosen) branch to `origin` |
 
 ---
@@ -663,11 +666,13 @@ sudo shutdown -h now
 
 Use this when you develop locally and want the same tree on the VM **without** logging in to run `git pull`.
 
+> **This project’s target VM** (Console): **`todc-ent-applications`** · zone **`us-west2-a`** · external IP shown in Compute Engine (use `gcloud compute ssh` by name; no need to type the IP). Override anytime with `GCP_VM_NAME` / `GCP_ZONE`.
+
 ### Prerequisites
 
 - Same as [Prerequisites](#prerequisites): `gcloud` installed and authenticated.
 - You can open an SSH session to the instance:  
-  `gcloud compute ssh doordash-bot --zone=us-central1-a`
+  `gcloud compute ssh todc-ent-applications --zone=us-west2-a`
 - **First time on the VM**: complete Chrome/Xvfb and Python setup (see [Step 2](#step-2-vm-setup-ssh-into-the-vm)) or run `bash deploy/02-vm-setup.sh` so `/opt/doordash-bot` exists and `.venv` + `.env` are configured.  
   `deploy.sh` creates `/opt/doordash-bot` and fixes ownership if missing, but it does **not** install Chrome or create `.env`.
 
@@ -677,7 +682,7 @@ From the **project root** on your laptop:
 
 | Command | What it does |
 |--------|----------------|
-| `./deploy.sh` | Rsync repo to the VM (default `doordash-bot` in `us-central1-a` → `/opt/doordash-bot`). Excludes `.git`, `.venv`, `.env`, `downloads/`, `logs/`, and `todc-marketing-*.json`. |
+| `./deploy.sh` | Rsync repo to the VM (default **`todc-ent-applications`** in **`us-west2-a`** → `/opt/doordash-bot`). Excludes `.git`, `.venv`, `.env`, `downloads/`, `logs/`, and `todc-marketing-*.json`. |
 | `./deploy.sh --install` | After sync, runs `pip install -r requirements.txt` inside `.venv` on the VM (activates `.venv` if present). |
 | `./deploy.sh --verify` | After sync, runs `deploy/04-verify.sh` on the VM. |
 | `./deploy.sh --delete` | Adds `rsync --delete` so extra files under the app dir on the VM are removed. **Use sparingly**; prefer the default incremental sync so ad-hoc files on the server are kept unless you know you want a mirror. |
@@ -686,8 +691,8 @@ From the **project root** on your laptop:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `GCP_VM_NAME` | `doordash-bot` | Instance name |
-| `GCP_ZONE` | `us-central1-a` | Zone |
+| `GCP_VM_NAME` | `todc-ent-applications` | Instance name |
+| `GCP_ZONE` | `us-west2-a` | Zone |
 | `GCP_REMOTE_DIR` | `/opt/doordash-bot` | Remote application path |
 | `GCP_RSYNC_IAP` | unset (`0`) | Set to `1` if you use [IAP tunneling](https://cloud.google.com/iap/docs/using-tcp-forwarding) for SSH |
 
@@ -695,8 +700,8 @@ Example:
 
 ```bash
 cd /path/to/Reporting-browser-use-claude-code
-export GCP_VM_NAME=doordash-bot
-export GCP_ZONE=us-central1-a
+export GCP_VM_NAME=todc-ent-applications
+export GCP_ZONE=us-west2-a
 ./deploy.sh --install
 ```
 
@@ -727,12 +732,12 @@ For interactive first-time setup of `origin` and default branch naming, you can 
 ## Quick Reference
 
 ```bash
-# SSH into the VM
-gcloud compute ssh doordash-bot --zone=us-central1-a
+# SSH into the VM (this project’s instance)
+gcloud compute ssh todc-ent-applications --zone=us-west2-a
 
 # Start/stop VM manually
-gcloud compute instances start doordash-bot --zone=us-central1-a
-gcloud compute instances stop doordash-bot --zone=us-central1-a
+gcloud compute instances start todc-ent-applications --zone=us-west2-a
+gcloud compute instances stop todc-ent-applications --zone=us-west2-a
 
 # Run the bot manually
 cd /opt/doordash-bot && source .venv/bin/activate && python main.py
