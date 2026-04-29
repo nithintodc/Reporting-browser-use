@@ -117,7 +117,7 @@ def _build_campaign_tools():
             if (allHaveSvg) rows.push(row);
         }
     }
-    // Fallback
+    // Fallback 1: any div with 7 SVG-bearing children
     if (rows.length < 6) {
         rows = [];
         var allDivs = container.querySelectorAll('div');
@@ -131,6 +131,29 @@ def _build_campaign_tools():
                 if (ok) rows.push(div);
             }
         }
+    }
+    // Fallback 2: div with 7 children, NO SVG requirement (grid after clearing)
+    if (rows.length < 6) {
+        var wkRect = weekdaysBtn.getBoundingClientRect();
+        var gridMinY = wkRect.bottom - 5;
+        rows = [];
+        var allDivs2 = container.querySelectorAll('div');
+        for (var d2 = 0; d2 < allDivs2.length; d2++) {
+            var dv2 = allDivs2[d2];
+            if (dv2.children.length === 7) {
+                var dvR = dv2.getBoundingClientRect();
+                if (dvR.top >= gridMinY && dvR.height > 25 && dvR.height < 200) {
+                    var childOk = true;
+                    for (var c3 = 0; c3 < 7; c3++) {
+                        var chR = dv2.children[c3].getBoundingClientRect();
+                        if (chR.width < 15 || chR.height < 15) { childOk = false; break; }
+                    }
+                    if (childOk) rows.push(dv2);
+                }
+            }
+        }
+        rows.sort(function(a, b) { return a.getBoundingClientRect().top - b.getBoundingClientRect().top; });
+        if (rows.length > 6) rows = rows.slice(rows.length - 6);
     }
     if (rows.length < 6) return JSON.stringify({error: 'Found ' + rows.length + ' grid rows, expected 6'});
 
@@ -359,22 +382,83 @@ def _build_campaign_tools():
                     pass
                 return 0
 
+            _JS_FIND_CELL = (
+                "(function(ri,ci){"
+                "var w=null,bs=document.querySelectorAll('button');"
+                "for(var i=0;i<bs.length;i++){if(bs[i].textContent.trim()==='Weekdays'){w=bs[i];break;}}"
+                "if(!w)return JSON.stringify({error:'no_weekdays'});"
+                "var c=w;for(var u=0;u<12;u++){c=c.parentElement;if(!c)break;}"
+                "if(!c)return JSON.stringify({error:'no_container'});"
+                "var wRect=w.getBoundingClientRect();var minY=wRect.bottom-5;"
+                "var rows=[];"
+                "var cr=c.querySelectorAll('div[class*=\"StyledInlineChildren\"]');"
+                "for(var r=0;r<cr.length;r++){var rw=cr[r];"
+                "if(rw.children.length===7){var ok=true;"
+                "for(var x=0;x<7;x++){if(!rw.children[x].querySelector('svg')){ok=false;break;}}"
+                "if(ok)rows.push(rw);}}"
+                "if(rows.length<6){rows=[];"
+                "for(var r2=0;r2<cr.length;r2++){var rw2=cr[r2];"
+                "if(rw2.children.length===7){"
+                "var rr=rw2.getBoundingClientRect();"
+                "if(rr.top>=minY&&rr.height>25&&rr.height<200){"
+                "var co=true;"
+                "for(var x2=0;x2<7;x2++){var ch=rw2.children[x2].getBoundingClientRect();"
+                "if(ch.width<15||ch.height<15){co=false;break;}}"
+                "if(co)rows.push(rw2);}}}}"
+                "if(rows.length<6){rows=[];"
+                "var ad=c.querySelectorAll('div');"
+                "for(var d=0;d<ad.length;d++){var dv=ad[d];"
+                "if(dv.children.length===7){"
+                "var dr=dv.getBoundingClientRect();"
+                "if(dr.top>=minY&&dr.height>25&&dr.height<200){"
+                "var ok3=true;"
+                "for(var x3=0;x3<7;x3++){var cr3=dv.children[x3].getBoundingClientRect();"
+                "if(cr3.width<15||cr3.height<15){ok3=false;break;}}"
+                "if(ok3)rows.push(dv);}}}}"
+                "rows.sort(function(a,b){return a.getBoundingClientRect().top-b.getBoundingClientRect().top;});"
+                "if(rows.length>6)rows=rows.slice(rows.length-6);"
+                "if(rows.length<6)return JSON.stringify({error:'rows_'+rows.length});"
+                "var cell=rows[ri].children[ci];"
+                "cell.scrollIntoView({behavior:'instant',block:'nearest'});"
+                "var rect=cell.getBoundingClientRect();"
+                "return JSON.stringify({x:Math.round(rect.left+rect.width/2),y:Math.round(rect.top+rect.height/2)});"
+                "})"
+            )
+
             async def _click_cell(tag: int, action: str) -> bool:
-                """Click a grid cell using initial-scan coordinates adjusted for banner shift."""
+                """Click a grid cell by finding it fresh in the DOM each time."""
+                row_idx = (tag - 1) // 7
+                col_idx = (tag - 1) % 7
+                row_label = _GRID_ROW_NAMES[row_idx]
+                col_name = _GRID_COL_NAMES[col_idx]
+                js = _JS_FIND_CELL + f"({row_idx},{col_idx})"
+                try:
+                    res = await cdp_client.send.Runtime.evaluate(
+                        params={"expression": js, "returnByValue": True, "awaitPromise": True},
+                        session_id=session_id,
+                    )
+                    raw = res.get("result", {}).get("value", "{}")
+                    coord = json.loads(raw) if isinstance(raw, str) else raw
+                    if "error" not in coord:
+                        x, y = coord.get("x", 0), coord.get("y", 0)
+                        if x and y:
+                            logger.info("set_schedule_grid: %s tag %d (%s/%s) at (%d,%d) [fresh]",
+                                        action, tag, row_label, col_name, x, y)
+                            await cdp_click(x, y)
+                            return True
+                    logger.debug("set_schedule_grid: fresh coord failed for tag %d: %s",
+                                 tag, coord.get("error", ""))
+                except Exception as e:
+                    logger.debug("set_schedule_grid: fresh coord JS error for tag %d: %s", tag, e)
+                # Fallback: cached coordinates + banner shift
                 x, y = cell_coords.get(tag, (0, 0))
                 if not (x and y):
-                    logger.warning("set_schedule_grid: no initial coord for tag %d", tag)
+                    logger.warning("set_schedule_grid: no coord for tag %d", tag)
                     return False
                 shift = await _get_banner_shift()
                 adj_y = y + shift
-                row_label = _GRID_ROW_NAMES[(tag - 1) // 7]
-                col_name  = _GRID_COL_NAMES[(tag - 1) % 7]
-                if shift:
-                    logger.info("set_schedule_grid: %s tag %d (%s/%s) at (%d,%d) [banner shift=%+d]",
-                                action, tag, row_label, col_name, x, adj_y, shift)
-                else:
-                    logger.info("set_schedule_grid: %s tag %d (%s/%s) at (%d,%d)",
-                                action, tag, row_label, col_name, x, adj_y)
+                logger.info("set_schedule_grid: %s tag %d (%s/%s) at (%d,%d) [cached, shift=%+d]",
+                            action, tag, row_label, col_name, x, adj_y, shift)
                 await cdp_click(x, adj_y)
                 return True
 
@@ -557,6 +641,28 @@ def _build_campaign_tools():
             }
         }
     }
+    if (rows.length < 6) {
+        var vWkRect = weekdaysBtn.getBoundingClientRect();
+        var vMinY = vWkRect.bottom - 5;
+        rows = [];
+        var allDivs3 = container.querySelectorAll('div');
+        for (var d3 = 0; d3 < allDivs3.length; d3++) {
+            var dv3 = allDivs3[d3];
+            if (dv3.children.length === 7) {
+                var dvR3 = dv3.getBoundingClientRect();
+                if (dvR3.top >= vMinY && dvR3.height > 25 && dvR3.height < 200) {
+                    var chOk = true;
+                    for (var c4 = 0; c4 < 7; c4++) {
+                        var chR4 = dv3.children[c4].getBoundingClientRect();
+                        if (chR4.width < 15 || chR4.height < 15) { chOk = false; break; }
+                    }
+                    if (chOk) rows.push(dv3);
+                }
+            }
+        }
+        rows.sort(function(a, b) { return a.getBoundingClientRect().top - b.getBoundingClientRect().top; });
+        if (rows.length > 6) rows = rows.slice(rows.length - 6);
+    }
 
     // Re-read checked state for all cells
     function isChecked(cellDiv) {
@@ -634,24 +740,11 @@ def _build_campaign_tools():
                     if extra:
                         logger.warning("set_schedule_grid: MISMATCH — still checked but unwanted: %s",
                                        ", ".join(f"{t}({_tag_label(t)})" for t in sorted(extra)))
-                    # Attempt correction using original cell coordinates
                     corrections = missing | extra
                     if corrections and len(corrections) <= 15:
                         logger.info("set_schedule_grid: CORRECTING %d cells...", len(corrections))
-                        corr_shift = await _get_banner_shift()
                         for corr_tag in sorted(corrections):
-                            if corr_tag in cell_coords:
-                                cx, cy = cell_coords[corr_tag]
-                                adj_cy = cy + corr_shift
-                                logger.info(
-                                    "set_schedule_grid: CORRECT tag %d (%s) at (%d, %d) shift=%+d",
-                                    corr_tag,
-                                    _tag_label(corr_tag),
-                                    cx,
-                                    adj_cy,
-                                    corr_shift,
-                                )
-                                await cdp_click(cx, adj_cy)
+                            if await _click_cell(corr_tag, "CORRECT"):
                                 clicked += 1
                         await asyncio.sleep(0.2)
 
@@ -689,6 +782,91 @@ def _build_campaign_tools():
         except Exception as e:
             logger.warning("set_schedule_grid failed: %s", e)
             return ActionResult(error=f"set_schedule_grid error: {e}")
+
+    @tools.action(
+        description=(
+            "Click the leftmost (lowest/smallest value) button under 'Maximum discount amount' "
+            "in the customer incentive modal. Always use this instead of manually clicking the "
+            "max discount buttons. Call after the incentive modal is open and minimum subtotal is set. "
+            "Returns the value of the button that was clicked."
+        ),
+    )
+    async def click_leftmost_max_discount(browser_session) -> ActionResult:
+        """Programmatically click the first/leftmost max discount button via CDP."""
+        try:
+            import json as _json
+            cdp_sess = await browser_session.get_or_create_cdp_session()
+            cdp_cli = cdp_sess.cdp_client
+            sess_id = cdp_sess.session_id
+
+            js = """
+(function() {
+    var allEls = document.querySelectorAll('*');
+    var labelY = -1;
+    for (var i = 0; i < allEls.length; i++) {
+        if (allEls[i].children.length === 0 &&
+            allEls[i].textContent.trim() === 'Maximum discount amount') {
+            var r = allEls[i].getBoundingClientRect();
+            labelY = r.bottom;
+            break;
+        }
+    }
+    if (labelY < 0) return JSON.stringify({error: 'Maximum discount amount label not found'});
+
+    var btns = document.querySelectorAll('button');
+    var candidates = [];
+    for (var j = 0; j < btns.length; j++) {
+        var txt = btns[j].textContent.trim();
+        if (txt.match(/^\\$\\d/) && btns[j].getBoundingClientRect().top > labelY - 10) {
+            candidates.push(btns[j]);
+        }
+    }
+    if (candidates.length === 0) return JSON.stringify({error: 'No $ buttons found below label'});
+
+    candidates.sort(function(a, b) {
+        var ar = a.getBoundingClientRect(), br = b.getBoundingClientRect();
+        var yDiff = ar.top - br.top;
+        if (Math.abs(yDiff) > 10) return yDiff;
+        return ar.left - br.left;
+    });
+
+    var btn = candidates[0];
+    btn.scrollIntoView({behavior: 'instant', block: 'nearest'});
+    var rect = btn.getBoundingClientRect();
+    return JSON.stringify({
+        x: Math.round(rect.left + rect.width / 2),
+        y: Math.round(rect.top + rect.height / 2),
+        text: btn.textContent.trim()
+    });
+})()
+"""
+            eval_result = await cdp_cli.send.Runtime.evaluate(
+                params={"expression": js, "returnByValue": True, "awaitPromise": True},
+                session_id=sess_id,
+            )
+            raw_val = eval_result.get("result", {}).get("value", "{}")
+            info = _json.loads(raw_val) if isinstance(raw_val, str) else raw_val
+
+            if "error" in info:
+                return ActionResult(error=info["error"])
+
+            x, y, text = info.get("x", 0), info.get("y", 0), info.get("text", "?")
+            if not (x and y):
+                return ActionResult(error="Could not get button coordinates")
+
+            await cdp_cli.send.Input.dispatchMouseEvent(
+                params={"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1},
+                session_id=sess_id,
+            )
+            await cdp_cli.send.Input.dispatchMouseEvent(
+                params={"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1},
+                session_id=sess_id,
+            )
+            logger.info("click_leftmost_max_discount: clicked '%s' at (%d,%d)", text, x, y)
+            return ActionResult(extracted_content=f"Clicked leftmost max discount button: {text}")
+        except Exception as e:
+            logger.warning("click_leftmost_max_discount failed: %s", e)
+            return ActionResult(error=f"click_leftmost_max_discount error: {e}")
 
     return tools
 
@@ -854,7 +1032,7 @@ STEP 3 — Set customer incentive:
 - Click "Custom" under Minimum subtotal. Click the input field.
 - Select all text (triple-click), type: {min_subtotal}
 - Wait 2s. VERIFY field shows {min_subtotal} or ${min_subtotal}. If it shows $25 or wrong value, clear and retype.
-- Click LEFTMOST button under "Maximum discount amount" (smallest value).
+- IMPORTANT: Use the click_leftmost_max_discount action to select the lowest maximum discount amount. Do NOT manually click any max discount button.
 - Click "Save".
 
 STEP 4 — Set schedule:
@@ -865,7 +1043,7 @@ STEP 4 — Set schedule:
 
 STEP 4B — Re-confirm Maximum discount amount (MANDATORY after schedule):
 - Click Edit (pencil) next to "Customer incentive". Wait for modal to open.
-- Look at the "Maximum discount amount" section. Click the LEFTMOST (smallest/lowest) value button.
+- IMPORTANT: Use the click_leftmost_max_discount action to select the lowest maximum discount amount. Do NOT manually click any max discount button.
 - Click "Save".
 - This step is REQUIRED because DoorDash may change available max discount options after the schedule is modified.
 
